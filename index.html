@@ -1,0 +1,3581 @@
+<!--
+  FICHIER GENERE AUTOMATIQUEMENT par scripts/build-github-page.js
+  Ne pas editer directement : modifier artifact/dashboard.html puis relancer
+    node scripts/build-github-page.js
+-->
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Sinistres Chauffeurs</title>
+<style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found]){display:none!important}</style>
+<style>#tab-unmatched, #tab-declarations, #tab-rapprochements { display: none !important; }</style>
+<script>
+/* ==========================================================================
+   Pont de compatibilite : reimplemente les deux capacites du viewer
+   d'artefact Claude dont le dashboard depend, pour qu'il tourne tel quel
+   sur GitHub Pages. GENERE par scripts/build-github-page.js — ne pas
+   editer ici, editer le script.
+   ========================================================================== */
+(function () {
+  "use strict";
+
+  var SHEET_CSV_URLS = {
+    "1VMGhNhGnATAbFIsbFT2mkAEyO55ZEOcATwpf-h1xnHA": "https://docs.google.com/spreadsheets/d/1VMGhNhGnATAbFIsbFT2mkAEyO55ZEOcATwpf-h1xnHA/gviz/tq?tqx=out:csv&sheet=AGREGATS_PUBLIC"
+  };
+
+  /* ---- mcp : lecture des feuilles Google publiees en CSV ---------------- */
+
+  // Le dashboard decode ce qu'il recoit avec atob + TextDecoder('utf-8')
+  // (base64ToUtf8), parce que le connecteur Drive renvoie du base64. On
+  // reencode donc le CSV en base64 ici : c'est ce qui permet de ne RIEN
+  // changer dans le dashboard.
+  function toBase64Utf8(text) {
+    var bytes = new TextEncoder().encode(text);
+    var binary = "";
+    for (var i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+
+  var mcpShim = {
+    callTool: function (server, tool, input) {
+      var fileId = input && input.fileId;
+      var url = SHEET_CSV_URLS[fileId];
+      if (!url) {
+        return Promise.reject({
+          code: "config_missing",
+          message: "Aucune URL CSV configuree pour le classeur " + fileId,
+        });
+      }
+      // credentials omis : on lit une feuille PUBLIEE, jamais la session
+      // Google du lecteur (qui ne servirait a rien en cross-origin, et
+      // ferait echouer la requete sur une feuille non publiee).
+      return fetch(url, { credentials: "omit" })
+        .then(function (res) {
+          if (!res.ok) {
+            throw {
+              code: "tool_error",
+              message: "HTTP " + res.status + " — le classeur " + fileId +
+                " n'est probablement pas publie sur le web (Fichier > Partager > Publier sur le web).",
+            };
+          }
+          return res.text();
+        })
+        .then(function (text) { return { payload: { content: toBase64Utf8(text) } }; });
+    },
+  };
+
+  /* ---- db : persistance locale au navigateur --------------------------- */
+  // DIFFERENCE ASSUMEE avec l'artefact : les rapprochements ne sont plus
+  // partages entre lecteurs. Chacun garde les siens. Un stockage partage
+  // demanderait un vrai backend, hors de portee d'une page statique.
+
+  var PREFIX = "sinistres-db:";
+
+  function readCollection(name) {
+    try {
+      var raw = localStorage.getItem(PREFIX + name);
+      return raw ? JSON.parse(raw) : {};
+    } catch (e) {
+      return {}; // navigation privee, stockage bloque... : on degrade
+    }
+  }
+
+  function writeCollection(name, docs) {
+    try {
+      localStorage.setItem(PREFIX + name, JSON.stringify(docs));
+    } catch (e) {
+      // Quota atteint ou stockage bloque : le dashboard remonte deja
+      // l'echec a l'ecran via notePersistFailure.
+      throw { code: "quota_exceeded", message: "Stockage du navigateur indisponible ou plein" };
+    }
+  }
+
+  function randomId() {
+    return Math.random().toString(36).slice(2) + Date.now().toString(36);
+  }
+
+  function splitDocPath(docPath) {
+    var parts = String(docPath).split("/");
+    var id = parts.pop();
+    return { collection: parts.join("/"), id: id };
+  }
+
+  function snapshotOf(id, data) {
+    return { id: id, exists: data !== undefined, data: function () { return data; } };
+  }
+
+  var dbShim = {
+    collection: function (name) {
+      return {
+        path: name,
+        get: function () {
+          var docs = readCollection(name);
+          return Promise.resolve({
+            docs: Object.keys(docs).map(function (id) { return snapshotOf(id, docs[id]); }),
+          });
+        },
+        add: function (data) {
+          try {
+            var docs = readCollection(name);
+            var id = randomId();
+            docs[id] = data;
+            writeCollection(name, docs);
+            return Promise.resolve({ id: id, path: name + "/" + id });
+          } catch (e) { return Promise.reject(e); }
+        },
+      };
+    },
+    doc: function (docPath) {
+      var loc = splitDocPath(docPath);
+      return {
+        id: loc.id,
+        path: docPath,
+        get: function () {
+          return Promise.resolve(snapshotOf(loc.id, readCollection(loc.collection)[loc.id]));
+        },
+        set: function (data) {
+          try {
+            var docs = readCollection(loc.collection);
+            docs[loc.id] = data;
+            writeCollection(loc.collection, docs);
+            return Promise.resolve();
+          } catch (e) { return Promise.reject(e); }
+        },
+        delete: function () {
+          try {
+            var docs = readCollection(loc.collection);
+            delete docs[loc.id];
+            writeCollection(loc.collection, docs);
+            return Promise.resolve();
+          } catch (e) { return Promise.reject(e); }
+        },
+      };
+    },
+  };
+
+  /* ---- window.claude.use(), meme contrat que le viewer d'artefact ------ */
+  window.claude = window.claude || {};
+  window.claude.use = function (name) {
+    if (name === "mcp") return Promise.resolve(mcpShim);
+    if (name === "db") return Promise.resolve(dbShim);
+    return Promise.resolve(null); // toute autre capacite : indisponible
+  };
+})();
+</script>
+<script>
+/* GENERE par scripts/build-github-page.js */
+document.addEventListener("DOMContentLoaded", function () {
+  var sub = document.querySelector(".brand-text p");
+  if (sub) {
+    sub.innerHTML = 'Vue anonymisée et partageable — chauffeurs et véhicules ' +
+      'remplacés par un pseudonyme stable (<span class="tabular">C-…</span>, ' +
+      '<span class="tabular">V-…</span>). Les compteurs, rangs de récidive et ' +
+      'taux restent exacts. Mise à jour à chaque run du pipeline.';
+  }
+}, { once: true });
+</script>
+</head>
+<body>
+<title>Sinistres Chauffeurs</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=DM+Sans:wght@400;500;600;700&display=swap">
+<style>
+  /* ---------- Tokens ---------- */
+  /* William, 2026-09-02 : charte reprise fidelement de PITLANE (l'outil
+     garage interne, apps/garage/src/styles/global.css) — memes valeurs de
+     couleur/police/rayon que l'app que William utilise au quotidien.
+     PITLANE est dark-first (theme par defaut = dark) ; le pattern 3-etats
+     habituel (:root=clair, media dark, [data-theme=dark]) est donc inverse
+     ici : :root=sombre, media (prefers-color-scheme: light)=clair,
+     [data-theme="light"] regagne sur un OS sombre. Les NOMS de variables
+     restent ceux d'origine de ce dashboard (--bg, --ink, --accent...) —
+     seules les VALEURS changent — pour ne rien casser dans les ~400 lignes
+     de CSS de composants qui les consomment deja plus bas. */
+  :root {
+    --bg: oklch(0.145 0 0);
+    --surface: #171923;
+    --surface-2: #1e2130;
+    --border: #2a2f45;
+    --border-strong: #3a4060;
+    --ink: #e8ecf4;
+    --ink-dim: #8892aa;
+    --ink-faint: #545e78;
+    --accent: #3a7fff;
+    --accent-ink: #ffffff;
+    --accent-soft: rgba(58, 127, 255, 0.12);
+    --accent-soft-border: rgba(58, 127, 255, 0.3);
+    --risk: #ef4444;
+    --risk-soft: rgba(239, 68, 68, 0.15);
+    --warn: #f97316;
+    --warn-soft: rgba(249, 115, 22, 0.15);
+    --good: #22c55e;
+    --good-soft: rgba(34, 197, 94, 0.15);
+    --new-dot: #a78bfa;
+    /* Rampe de severite (1er -> 4e+ sinistre d'un meme chauffeur) — William,
+       2026-09-02, graphiques "Evolution des recidives" (DTO/LOC). */
+    --sev-1: #f7b8c2;
+    --sev-2: #ef7f8f;
+    --sev-3: #e14c63;
+    --sev-4: #b0233b;
+    --shadow: 0 2px 12px rgba(0, 0, 0, 0.4);
+    --radius: 12px;
+    --mono: "Space Grotesk", monospace;
+    --display: "Space Grotesk", sans-serif;
+    --body: "DM Sans", system-ui, sans-serif;
+  }
+
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #f0f2f7;
+      --surface: #ffffff;
+      --surface-2: #e8ecf5;
+      --border: #c8d0e0;
+      --border-strong: #a8b4cc;
+      --ink: #0f1117;
+      --ink-dim: #374151;
+      --ink-faint: #6b7280;
+      --accent: #2563eb;
+      --accent-ink: #ffffff;
+      --accent-soft: rgba(37, 99, 235, 0.1);
+      --accent-soft-border: rgba(37, 99, 235, 0.25);
+      --risk: #dc2626;
+      --risk-soft: #fee2e2;
+      --warn: #c2410c;
+      --warn-soft: #fed7aa;
+      --good: #16a34a;
+      --good-soft: #dcfce7;
+      --new-dot: #7c3aed;
+      --sev-1: #fbd1d8;
+      --sev-2: #f29aa8;
+      --sev-3: #e2637a;
+      --sev-4: #b8234a;
+      --shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+    }
+  }
+
+  :root[data-theme="light"] {
+    --bg: #f0f2f7;
+    --surface: #ffffff;
+    --surface-2: #e8ecf5;
+    --border: #c8d0e0;
+    --border-strong: #a8b4cc;
+    --ink: #0f1117;
+    --ink-dim: #374151;
+    --ink-faint: #6b7280;
+    --accent: #2563eb;
+    --accent-ink: #ffffff;
+    --accent-soft: rgba(37, 99, 235, 0.1);
+    --accent-soft-border: rgba(37, 99, 235, 0.25);
+    --risk: #dc2626;
+    --risk-soft: #fee2e2;
+    --warn: #c2410c;
+    --warn-soft: #fed7aa;
+    --good: #16a34a;
+    --good-soft: #dcfce7;
+    --new-dot: #7c3aed;
+    --shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+  }
+
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 14px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+  }
+  ::selection { background: var(--accent-soft); }
+  a { color: var(--accent); }
+  button { font-family: inherit; }
+  *:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *, *::before, *::after { animation-duration: 0.001ms !important; transition-duration: 0.001ms !important; }
+  }
+
+  .tabular { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+
+  /* ---------- Shell ---------- */
+  .shell {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 20px 24px 64px;
+  }
+
+  header.topbar {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 16px;
+    flex-wrap: wrap;
+    padding-bottom: 16px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 20px;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand-mark {
+    width: 38px; height: 38px;
+    border-radius: 9px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    display: grid;
+    place-items: center;
+    font-family: var(--display);
+    font-weight: 800;
+    font-size: 15px;
+    flex: none;
+  }
+  .brand-text h1 {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 19px;
+    margin: 0;
+    letter-spacing: -0.01em;
+  }
+  .brand-text p {
+    margin: 2px 0 0;
+    color: var(--ink-dim);
+    font-size: 12.5px;
+  }
+
+  .source-box {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 8px 10px 8px 14px;
+    box-shadow: var(--shadow);
+  }
+  .source-status { display: flex; flex-direction: column; gap: 2px; }
+  .source-status .label {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--ink-faint);
+  }
+  .source-status .value {
+    font-size: 12.5px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
+  .dot.live { background: var(--good); }
+  .dot.demo { background: var(--warn); }
+  .dot.error { background: var(--risk); }
+
+  button.refresh {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    background: var(--accent);
+    color: var(--accent-ink);
+    border: none;
+    border-radius: 8px;
+    padding: 9px 14px;
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: filter 0.12s ease;
+  }
+  button.refresh:hover { filter: brightness(1.08); }
+  button.refresh:active { filter: brightness(0.94); }
+  button.refresh:disabled { opacity: 0.55; cursor: default; }
+  button.refresh svg { width: 14px; height: 14px; }
+  .spin { animation: spin 0.9s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .banner {
+    display: flex;
+    gap: 10px;
+    align-items: flex-start;
+    padding: 11px 14px;
+    border-radius: var(--radius);
+    font-size: 12.5px;
+    margin-bottom: 18px;
+    border: 1px solid var(--accent-soft-border);
+    background: var(--accent-soft);
+    color: var(--ink);
+  }
+  .banner.warn { border-color: var(--warn-soft); background: var(--warn-soft); }
+  .banner.risk { border-color: var(--risk-soft); background: var(--risk-soft); }
+  .banner strong { font-weight: 600; }
+  .banner .icon { flex: none; margin-top: 1px; }
+
+  /* KPIs */
+  .kpi-row {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .kpi {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 14px 16px;
+    box-shadow: var(--shadow);
+  }
+  .kpi .kpi-label {
+    font-size: 11.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+    margin-bottom: 8px;
+  }
+  .kpi .kpi-value {
+    font-family: var(--display);
+    font-weight: 700;
+    font-size: 28px;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+  }
+  .kpi .kpi-unit { font-size: 13px; font-weight: 500; color: var(--ink-dim); }
+  .kpi .kpi-sub { font-size: 12px; color: var(--ink-dim); margin-top: 4px; }
+  .kpi.risk .kpi-value { color: var(--risk); }
+
+  /* Filters */
+  .filters {
+    display: flex;
+    gap: 10px;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    margin-bottom: 18px;
+    box-shadow: var(--shadow);
+  }
+  .field { display: flex; flex-direction: column; gap: 5px; min-width: 130px; }
+  .field label {
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--ink-faint);
+  }
+  select, input[type="month"], input[type="text"].driver-search {
+    font-family: inherit;
+    font-size: 13px;
+    color: var(--ink);
+    background: var(--surface-2);
+    border: 1px solid var(--border-strong);
+    border-radius: 7px;
+    padding: 7px 9px;
+  }
+  input[type="text"].driver-search { width: 100%; margin-top: 6px; }
+  input[type="text"].driver-search:focus { outline: none; border-color: var(--accent); }
+  .driver-search-results { margin-top: 4px; }
+  .driver-search-results:empty { margin-top: 0; }
+  .field.range { flex-direction: row; align-items: flex-end; gap: 6px; }
+  .field.range .sub { display: flex; flex-direction: column; gap: 5px; }
+  .filters .reset {
+    margin-left: auto;
+    background: none;
+    border: 1px solid var(--border-strong);
+    color: var(--ink-dim);
+    border-radius: 7px;
+    padding: 7px 12px;
+    font-size: 12.5px;
+    cursor: pointer;
+    align-self: flex-end;
+  }
+  .filters .reset:hover { color: var(--ink); border-color: var(--ink-faint); }
+
+  /* William, 2026-09-05 : .reset n'etait style que sous .filters — les
+     boutons "Exporter en CSV" / "Tout supprimer" des cartes heritaient donc
+     du bouton natif du navigateur. Meme apparence partout. */
+  button.reset {
+    background: none;
+    border: 1px solid var(--border-strong);
+    color: var(--ink-dim);
+    border-radius: 7px;
+    padding: 5px 10px;
+    font-size: 12.5px;
+    cursor: pointer;
+  }
+  button.reset:hover:not(:disabled) { color: var(--ink); border-color: var(--ink-faint); }
+  button.reset:disabled { opacity: 0.5; cursor: default; }
+  button.reset.danger { border-color: var(--risk); color: var(--risk); }
+  button.reset.danger:hover:not(:disabled) { background: var(--risk-soft); color: var(--risk); }
+  /* Boutons d'action en ligne dans les listes ("Confirmer", "Lier",
+     "Délier") — meme famille, en plus petit. */
+  .history button, .fuzzy-candidates button {
+    background: none;
+    border: 1px solid var(--border-strong);
+    color: var(--ink-dim);
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 11.5px;
+    font-family: inherit;
+    cursor: pointer;
+  }
+  .history button:hover, .fuzzy-candidates button:hover { color: var(--ink); border-color: var(--accent); }
+
+  /* Tabs — pilules PITLANE (.tab-group / .tab.active dans global.css) plutot
+     que le soulignement d'origine : c'est le vocabulaire reel de l'outil. */
+  .tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 18px;
+  }
+  .tab {
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-family: var(--display);
+    font-weight: 600;
+    font-size: 12.5px;
+    color: var(--ink-dim);
+    padding: 6px 14px;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .tab[aria-selected="true"] {
+    background: var(--accent);
+    color: var(--accent-ink);
+    border-color: var(--accent);
+  }
+  .tab:hover:not([aria-selected="true"]) { color: var(--ink); border-color: var(--ink-faint); }
+
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* Table */
+  .table-wrap {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    overflow-x: auto;
+  }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  thead th {
+    text-align: left;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--ink-faint);
+    padding: 11px 14px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    cursor: pointer;
+    user-select: none;
+  }
+  thead th:hover { color: var(--ink-dim); }
+  thead th .arrow { margin-left: 4px; opacity: 0.5; }
+  tbody td {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    white-space: nowrap;
+    vertical-align: middle;
+  }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr.clickable { cursor: pointer; }
+  tbody tr.clickable:hover { background: var(--surface-2); }
+  tbody tr.expanded { background: var(--accent-soft); }
+  .name-cell { font-weight: 600; }
+  .muted { color: var(--ink-dim); }
+
+  .pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    padding: 3px 9px;
+    border-radius: 999px;
+    font-size: 11.5px;
+    font-weight: 600;
+  }
+  .pill.dto { background: var(--accent-soft); color: var(--accent); }
+  .pill.loc { background: var(--warn-soft); color: var(--warn); }
+  .pill.churn-yes { background: var(--risk-soft); color: var(--risk); }
+  .pill.churn-no { background: var(--good-soft); color: var(--good); }
+  .pill.new::before { content: "●"; color: var(--new-dot); font-size: 8px; }
+
+  .trend { display: inline-flex; align-items: center; gap: 4px; font-size: 12.5px; }
+  .trend.up { color: var(--risk); }
+  .trend.down { color: var(--good); }
+  .trend.flat { color: var(--ink-faint); }
+
+  .empty-state {
+    padding: 48px 20px;
+    text-align: center;
+    color: var(--ink-dim);
+  }
+  .empty-state .glyph { font-size: 26px; margin-bottom: 8px; }
+  .empty-state p { margin: 4px 0; }
+
+  /* Detail drawer */
+  .detail {
+    margin-top: 14px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 16px 18px;
+    box-shadow: var(--shadow);
+  }
+  .detail h3 {
+    font-family: var(--display);
+    font-size: 15px;
+    margin: 0 0 4px;
+  }
+  .detail .detail-sub { color: var(--ink-dim); font-size: 12.5px; margin-bottom: 12px; }
+  .detail .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+  .chip {
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-size: 11.5px;
+    font-family: var(--mono);
+  }
+  .detail ul.history, .chart-card ul.history { list-style: none; margin: 0; padding: 0; }
+  .detail ul.history li, .chart-card ul.history li {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 7px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 12.5px;
+    flex-wrap: wrap;
+  }
+  .detail ul.history li:last-child, .chart-card ul.history li:last-child { border-bottom: none; }
+  .fuzzy-candidates { list-style: none; margin: 4px 0 0; padding: 0 0 0 16px; width: 100%; border-left: 2px solid var(--border); }
+  .fuzzy-candidates li { display: flex; flex-direction: column; gap: 2px; padding: 4px 0 4px 8px; font-size: 12px; border-bottom: none; }
+  .detail-close {
+    float: right;
+    background: none;
+    border: none;
+    color: var(--ink-faint);
+    cursor: pointer;
+    font-size: 13px;
+  }
+  .detail-close:hover { color: var(--ink); }
+
+  /* Temporal view */
+  .chart-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 18px 18px 8px;
+    box-shadow: var(--shadow);
+    margin-bottom: 16px;
+  }
+  .chart-card h3 {
+    font-family: var(--display);
+    font-size: 14px;
+    margin: 0 0 2px;
+  }
+  .chart-card .chart-note { color: var(--ink-dim); font-size: 12px; margin-bottom: 14px; }
+  .chart-scroll { overflow-x: auto; }
+  svg.chart { display: block; min-width: 100%; }
+  .bar-dto { fill: var(--accent); }
+  .bar-loc { fill: var(--warn); }
+  .axis-label { font-size: 10px; fill: var(--ink-faint); font-family: var(--body); }
+  .value-label { font-size: 10px; font-weight: 600; fill: var(--ink); font-family: var(--body); }
+  .grid-line { stroke: var(--border); stroke-width: 1; }
+  .line-rate { fill: none; stroke: var(--risk); stroke-width: 2; }
+  .dot-rate { fill: var(--risk); }
+  .bar-clickable { cursor: pointer; }
+  .bar-clickable:hover .bar-dto, .bar-clickable:hover .bar-loc { opacity: 0.75; }
+  .bar-clickable:hover .dot-rate { r: 5; }
+  .legend { display: flex; gap: 16px; font-size: 12px; color: var(--ink-dim); margin-bottom: 10px; }
+  .legend .swatch { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-right: 5px; }
+
+  footer.foot {
+    margin-top: 28px;
+    text-align: center;
+    color: var(--ink-faint);
+    font-size: 11.5px;
+  }
+
+  @media (max-width: 720px) {
+    .kpi-row { grid-template-columns: 1fr; }
+    header.topbar { flex-direction: column; }
+    .source-box { width: 100%; justify-content: space-between; }
+  }
+</style>
+
+<div class="shell">
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">SC</div>
+      <div class="brand-text">
+        <h1>Sinistres Chauffeurs</h1>
+        <p>Classement, véhicules et tendances — lecture directe de <span class="tabular">Immobilisations_v05/2026</span></p>
+      </div>
+    </div>
+    <div class="source-box">
+      <div class="source-status">
+        <span class="label">Source des données</span>
+        <span class="value"><span id="source-dot" class="dot demo"></span><span id="source-text">Jeu de démonstration</span></span>
+      </div>
+      <button class="refresh" id="refresh-btn" type="button">
+        <svg id="refresh-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M13.5 8a5.5 5.5 0 1 1-1.7-4M13.5 2v3.5H10"/></svg>
+        <span id="refresh-label">Actualiser</span>
+      </button>
+    </div>
+  </header>
+
+  <div id="banner-slot"></div>
+
+  <section class="kpi-row" id="kpi-row" aria-label="Indicateurs clés"></section>
+
+  <section class="filters" id="filters" aria-label="Filtres">
+    <div class="field">
+      <label for="f-location">Type de location</label>
+      <select id="f-location">
+        <option value="all">Tous</option>
+        <option value="DTO">DTO</option>
+        <option value="LOC">LOC</option>
+      </select>
+    </div>
+    <div class="field">
+      <label for="f-seniority">Tranche de séniorité</label>
+      <select id="f-seniority">
+        <option value="all">Toutes</option>
+      </select>
+    </div>
+    <div class="field range">
+      <div class="sub">
+        <label for="f-from">Période — du</label>
+        <input type="month" id="f-from">
+      </div>
+      <div class="sub">
+        <label for="f-to">au</label>
+        <input type="month" id="f-to">
+      </div>
+    </div>
+    <div class="field">
+      <label for="f-churn">Statut churn</label>
+      <select id="f-churn">
+        <option value="all">Tous</option>
+        <option value="active">Actif</option>
+        <option value="churned">Parti</option>
+      </select>
+    </div>
+    <button class="reset" id="f-reset" type="button">Réinitialiser</button>
+  </section>
+
+  <nav class="tabs" role="tablist" aria-label="Vues">
+    <button class="tab" id="tab-drivers" role="tab" aria-selected="true">Classement chauffeurs</button>
+    <button class="tab" id="tab-vehicles" role="tab" aria-selected="false">Vue véhicule</button>
+    <button class="tab" id="tab-dtoloc" role="tab" aria-selected="false">DTO vs Location</button>
+    <button class="tab" id="tab-unmatched" role="tab" aria-selected="false">Non rattachés</button>
+    <button class="tab" id="tab-declarations" role="tab" aria-selected="false">Déclarations</button>
+    <button class="tab" id="tab-rapprochements" role="tab" aria-selected="false">Rapprochements</button>
+  </nav>
+
+  <section class="panel active" id="panel-drivers"></section>
+  <section class="panel" id="panel-vehicles"></section>
+  <section class="panel" id="panel-dtoloc"></section>
+  <section class="panel" id="panel-unmatched"></section>
+  <section class="panel" id="panel-declarations"></section>
+  <section class="panel" id="panel-rapprochements"></section>
+
+  <footer class="foot">Séniorité, périodes et statuts calculés côté client à partir de <span class="tabular">Immobilisations_v05/2026</span> — le Sheet reste la seule source de vérité.</footer>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* =========================================================
+     1. Demo dataset — matches the SINISTRES_MASTER FinalRecord
+        schema (src/merge-and-finalize.js FinalRecord = PeriodRecord
+        + {driverKey, sinistreId, isNew, hasChurned}). Used whenever
+        the live Google Drive read fails, is empty, or is unavailable
+        — the sheet is written by an Apps Script trigger that has not
+        run for the first time yet.
+     ========================================================= */
+  var SENIORITY_BUCKETS = ["< 3 mois", "3-12 mois", "1-2 ans", "2 ans et +"];
+
+  function rec(o) {
+    return Object.assign({
+      driverId: null, dateSortie: null, dateSinistre: null,
+      dureeDesTravaux: null, type: "Sinistre", acquisitionDate: null, firstShiftDate: null,
+      hasChurned: false, matchMethod: "OK",
+      isNew: false
+    }, o);
+  }
+
+  // NB: trancheSeniorite n'est PAS hardcodee ici — elle est deliberement
+  // laissee a deriveSeniority() qui la calcule a partir de firstShiftDate
+  // (I5), exactement comme le fera SINISTRES_MASTER une fois le pipeline
+  // corrige. La coder en dur masquerait a nouveau ce que /I4 vise a
+  // exposer : un jeu de demo qui hardcode les champs casses de la
+  // production reelle plutot que de reproduire leur calcul.
+  var DEMO_RECORDS = []; // vide par scripts/build-github-page.js (donnees personnelles reelles)
+
+  // Demo illustrant une correlation note basse <-> plus de sinistres — les
+  // vrais chiffres viennent du sheet "Enregistrement chauffeurs" en mode live.
+  var DEMO_RECRUITMENT = []; // vide par scripts/build-github-page.js (donnees personnelles reelles)
+
+  /* =========================================================
+     2. State
+     ========================================================= */
+  var state = {
+    records: [],
+    dataMode: "demo", // "demo" | "live" | "live-partial"
+    lastUpdated: null,
+    filters: { location: "all", seniority: "all", from: "", to: "", churn: "all" },
+    tab: "drivers",
+    sort: { drivers: { key: "nbSinistresDriver", dir: -1 }, vehicles: { key: "nbSinistresVehicule", dir: -1 } },
+    expandedDriver: null,
+    expandedVehicle: null,
+    refreshing: false,
+    debugStage: null,
+    // Score de test de conduite au recrutement (sheet "Enregistrement
+    // chauffeurs"), rapproche par nom normalise — alimente la vue
+    // "Recrutement" (correlation note vs accidentalite).
+    recruitment: { byKey: {}, dataMode: "demo" },
+    // William, 2026-09-03 : quel champ la recherche libre de "Non
+    // rattachés" compare — "name" (defaut) | "phone" | "permit" | "birthDate".
+    unmatchedSearchMode: "name",
+    // Declarations de sinistre assureur (sheet "suivi declaration de
+    // sinistre", tenu a jour en continu par William) — alimente l'onglet
+    // "Déclarations" (rapprochement recurrent avec Immobilisations_v05/2026).
+    declarations: { rows: [], dataMode: "demo" }
+  };
+
+  /* =========================================================
+     3. Parsing helpers — normalize whatever the sheet (or demo
+        data) provides into a consistent shape for aggregation.
+     ========================================================= */
+  function monthKey(iso) { return iso ? String(iso).slice(0, 7) : null; }
+
+  // Meme logique que src/name-normalization.js (normalizeName) — utilisee
+  // pour rapprocher les chauffeurs entre le pipeline sinistres et le sheet
+  // de recrutement, qui n'ont pas d'identifiant commun.
+  function normalizeDriverName(raw) {
+    if (!raw) return "";
+    return String(raw).toLowerCase().trim()
+      .normalize("NFD").replace(/[̀-ͯ]/g, "")
+      .replace(/[^a-z ]/g, " ").replace(/\s+/g, " ").trim();
+  }
+
+  function pick(row, keys) {
+    // 'NULL' est le sentinel ecrit par appscript/Code.js a la place d'une
+    // cellule vide, pour empecher l'apercu texte du connecteur Drive de
+    // supprimer les cellules vides et decaler les colonnes suivantes
+    // (confirme en donnees reelles le 2026-08-20) — traite comme absent ici.
+    for (var i = 0; i < keys.length; i++) {
+      var v = row[keys[i]];
+      if (v !== undefined && v !== null && v !== "" && v !== "NULL") return v;
+    }
+    return null;
+  }
+
+  function toBool(v) {
+    if (typeof v === "boolean") return v;
+    if (v === null || v === undefined) return null;
+    var s = String(v).trim().toLowerCase();
+    if (["true", "yes", "oui", "1"].indexOf(s) !== -1) return true;
+    if (["false", "no", "non", "0"].indexOf(s) !== -1) return false;
+    return null;
+  }
+
+  // Séniorité = temps écoulé entre la First Shift Date du chauffeur (sa
+  // toute première prise de service, tous véhicules confondus) et la date
+  // de référence du sinistre — jamais la date d'acquisition du véhicule
+  // (acquisitionDate), qui ne dit rien de l'ancienneté du chauffeur (I5).
+  // William, 2026-08-28 : "First Shift Date Date" s'est revelee etre la
+  // date du COUPLE (chauffeur, vehicule), pas la vraie premiere prise de
+  // service du chauffeur — on prefere donc "Driver First Shift Date" (vrai
+  // minimum tous vehicules confondus, cf. computeDriverFirstShiftDates
+  // dans src/merge-and-finalize.js) des qu'elle est disponible.
+  // William, 2026-09-03 : deux bugs corriges ici, trouves en verifiant
+  // contre le sheet live (ex: AA-000-XX, Driver First Shift Date
+  // 2025-03-08, Date Sinistre 2025-10-03, Tranche de séniorité serveur
+  // encore NULL faute de Date Reference recalculee — un cas parmi 383/439
+  // lignes ancienne appli qui ont pourtant deja un Driver First Shift Date
+  // exploitable) :
+  //  1. Le repli cherchait dateReference sous la cle litterale
+  //     "dateReference" — qui n'existe JAMAIS sur une ligne brute du sheet
+  //     (l'en-tete reel est "Date Reference", avec espace) : ref valait
+  //     toujours null, le repli ne se declenchait donc jamais. On recoit
+  //     maintenant le dateReference DEJA resolu par normalizeRecord (qui,
+  //     lui, sait retomber sur Date Sinistre Date/Date D Entree Date).
+  //  2. Le repli utilisait encore l'ancien schema a 4 tranches
+  //     ("< 3 mois", "3-12 mois"...) et le champ firstShiftDate par
+  //     enregistrement (portee couple, imprecise) — desormais alignes sur
+  //     le calcul serveur (trancheSeniorite_ dans merge-and-finalize.js) :
+  //     memes 5 tranches, Driver First Shift Date exclusivement, avec la
+  //     meme garde chronologique (inutilisable si posterieur au sinistre).
+  function deriveSeniority(row, dateReference) {
+    var direct = pick(row, ["trancheSeniorite", "Tranche de séniorité", "tranche_seniorite"]);
+    if (direct) return direct;
+    var driverFirstShift = pick(row, ["driverFirstShiftDate", "Driver First Shift Date"]);
+    driverFirstShift = driverFirstShift ? String(driverFirstShift).slice(0, 10) : null;
+    if (!driverFirstShift || !dateReference || driverFirstShift > dateReference) return null;
+    var months = monthsBetween(driverFirstShift, dateReference);
+    if (months == null || months < 0) return null;
+    if (months < 3) return "0-3 mois";
+    if (months < 6) return "3-6 mois";
+    if (months < 12) return "6-12 mois";
+    if (months < 24) return "12-24 mois";
+    return "24-48 mois";
+  }
+
+  function monthsBetween(a, b) {
+    var da = new Date(a), db = new Date(b);
+    if (isNaN(da) || isNaN(db)) return null;
+    return (db.getFullYear() - da.getFullYear()) * 12 + (db.getMonth() - da.getMonth());
+  }
+
+  function daysBetweenIso(a, b) {
+    var da = new Date(a + "T00:00:00Z"), db = new Date(b + "T00:00:00Z");
+    if (isNaN(da) || isNaN(db)) return null;
+    return Math.round((db - da) / 86400000);
+  }
+
+  // William, 2026-09-02 : pour un sinistre ORPHELIN (aucun chauffeur
+  // identifie au moment du sinistre, cf. matchMethod — ancien ET nouveau
+  // confondus), propose EN AFFICHAGE SEULEMENT le chauffeur connu le plus
+  // proche dans le temps sur la MEME plaque (toutes sources confondues,
+  // avant ou apres le sinistre). Jamais applique : le sinistre reste
+  // comptabilise comme orphelin dans tous les compteurs.
+  function suggestDriversForOrphelins(records) {
+    var byPlaque = {};
+    records.forEach(function (r) {
+      if (!byPlaque[r.plaque]) byPlaque[r.plaque] = [];
+      byPlaque[r.plaque].push(r);
+    });
+
+    return records
+      .filter(function (r) { return r.matchMethod === "ORPHELIN"; })
+      .map(function (o) {
+        var best = null, bestGap = null;
+        (byPlaque[o.plaque] || []).forEach(function (c) {
+          if (c === o || c.matchMethod === "ORPHELIN" || !c.driverKey || c.driverKey === "inconnu") return;
+          var gap = daysBetweenIso(o.dateReference, c.dateReference);
+          if (gap === null) return;
+          var absGap = Math.abs(gap);
+          if (bestGap === null || absGap < bestGap) { bestGap = absGap; best = c; }
+        });
+        return {
+          plaque: o.plaque, dateReference: o.dateReference, sinistreId: o.sinistreId, source: o.source,
+          suggestedName: best ? best.name : null,
+          suggestedDate: best ? best.dateReference : null,
+          suggestedPhone: best ? best.phone : null,
+          suggestedLicenceNumber: best ? best.licenceNumber : null,
+          gapDays: bestGap
+        };
+      });
+  }
+
+  function renderOrphelinSuggestionsCard(list) {
+    var withSuggestion = list.filter(function (d) { return d.suggestedName; })
+      .sort(function (a, b) { return a.gapDays - b.gapDays; });
+    var withoutSuggestion = list.filter(function (d) { return !d.suggestedName; });
+    return '<div class="chart-card"><h3>Sinistres orphelins (véhicule) — suggestion de chauffeur (' + list.length + ')</h3>' +
+      '<div class="chart-note">Sinistres sans chauffeur identifié (ancien + nouveau confondus) — suggestion basée sur le chauffeur connu le plus proche dans le temps sur la MÊME plaque, avant ou après le sinistre. "Confirmer" note juste que tu as vérifié — ça ne modifie jamais le sheet source (le sinistre reste ORPHELIN dans les compteurs) ; la correction réelle se fait toujours dans Immobilisations_v05/2026 par le pipeline.</div>' +
+      (list.length === 0
+        ? '<div class="chart-note">Aucun sinistre orphelin sur la sélection actuelle.</div>'
+        : '<ul class="history unmatched-list">' +
+            withSuggestion.map(function (d) {
+              var already = confirmedOrphelins[orphelinKeyOf(d)];
+              return "<li><span>" + esc(d.plaque) + " — " + fmtDate(d.dateReference) + "</span>" +
+                "<span class=\"muted\">suggéré : " + esc(d.suggestedName) + " (" + fmtDate(d.suggestedDate) + ", écart " + d.gapDays + "j)" +
+                (d.suggestedPhone ? " · tél: " + esc(d.suggestedPhone) : "") +
+                (d.suggestedLicenceNumber ? " · permis: " + esc(d.suggestedLicenceNumber) : "") +
+                (already
+                  ? " · <strong>✓ confirmé</strong>"
+                  : " · <button type=\"button\" data-confirm-orphelin data-plaque=\"" + esc(d.plaque) + "\" data-date-reference=\"" + esc(d.dateReference) + "\" data-suggested-name=\"" + esc(d.suggestedName) + "\">Confirmer</button>") +
+                "</span></li>";
+            }).join("") +
+            withoutSuggestion.map(function (d) {
+              return "<li><span>" + esc(d.plaque) + " — " + fmtDate(d.dateReference) + "</span>" +
+                "<span class=\"muted\">aucun autre chauffeur connu sur cette plaque</span></li>";
+            }).join("") +
+          "</ul>") +
+      "</div>";
+  }
+
+  // Normalizes one raw row (from the live sheet CSV or the demo array)
+  // into the field set the dashboard actually reads. Never throws —
+  // missing/odd fields degrade to null rather than breaking the page.
+  function normalizeRecord(row) {
+    var plaque = pick(row, ["plaque", "Plaque", "Licence Plate", "License Plate"]);
+    var name = pick(row, ["name", "Name"]);
+    // William, 2026-09-03 : "Driver ID" (colonne unique melangeant les 2
+    // systemes d'ID) remplacee par "Flott ID" (ancienne appli) / "TOM ID"
+    // (nouvelle appli) — un seul des deux est jamais rempli par ligne.
+    var driverKey = pick(row, ["driverKey", "driver_key"]) || (name ? normalizeDriverName(name) : pick(row, ["driverId", "Flott ID", "TOM ID", "Driver ID", "ID"]));
+    var dateReference = pick(row, ["dateReference", "Date Reference", "Helper date ref sinistre"]) || pick(row, ["dateSinistre", "Date Sinistre Date"]) || pick(row, ["dateEntree", "Date D Entree Date"]);
+    if (!plaque || !dateReference) return null;
+    var typeLocation = pick(row, ["typeLocation", "Type de location", "Type"]);
+    if (typeLocation) {
+      var tl = String(typeLocation).toUpperCase();
+      typeLocation = tl.indexOf("DTO") !== -1 ? "DTO" : (tl.indexOf("LOC") !== -1 ? "LOC" : typeLocation);
+    }
+    var duree = pick(row, ["dureeDesTravaux", "Duree Des Travaux"]);
+    var firstShiftDate = pick(row, ["firstShiftDate", "First Shift Date Date"]);
+    var driverFirstShiftDate = pick(row, ["driverFirstShiftDate", "Driver First Shift Date"]);
+    var vehicleFirstShiftDate = pick(row, ["vehicleFirstShiftDate", "Vehicle First Shift Date"]);
+    return {
+      plaque: String(plaque).trim(),
+      driverId: pick(row, ["driverId", "Flott ID", "TOM ID", "Driver ID", "ID"]),
+      name: name ? String(name).trim() : "Inconnu",
+      driverKey: driverKey || "inconnu",
+      dateReference: String(dateReference).slice(0, 10),
+      monthKey: monthKey(String(dateReference).slice(0, 10)),
+      dureeDesTravaux: duree !== null ? Number(duree) || 0 : null,
+      typeLocation: typeLocation || "Inconnu",
+      hasChurned: toBool(pick(row, ["hasChurned", "Has Churned", "Has Churned (Yes / No)"])),
+      source: pick(row, ["source"]) || "inconnu",
+      isNew: toBool(pick(row, ["isNew", "NEW"])) || false,
+      sinistreId: pick(row, ["sinistreId", "sinistre_id"]),
+      // OK ou ORPHELIN (aucun chauffeur identifie au moment du sinistre) —
+      // William, 2026-09-02, pour suggestDriversForOrphelins.
+      matchMethod: pick(row, ["matchMethod", "match_method"]),
+      trancheSeniorite: deriveSeniority(row, String(dateReference).slice(0, 10)),
+      // Conserve la date brute (pas juste la tranche calculee au moment du
+      // sinistre) pour pouvoir prendre le minimum sur tous les
+      // enregistrements d'un chauffeur — un meme chauffeur peut avoir des
+      // lignes issues de sources differentes (ancien/nouveau) qui ne
+      // portent pas toutes cette info de la meme facon.
+      firstShiftDate: firstShiftDate ? String(firstShiftDate).slice(0, 10) : null,
+      // Vraie date de premier shift du CHAUFFEUR (tous vehicules confondus,
+      // calculee cote pipeline sur HISTORIQUE_NOUVELLE_APPLI) — a distinguer
+      // de firstShiftDate ci-dessus, qui reste la date sur CE vehicule
+      // precis. William, 2026-08-28.
+      driverFirstShiftDate: driverFirstShiftDate ? String(driverFirstShiftDate).slice(0, 10) : null,
+      // Vraie date de premiere mise en service du VEHICULE (tous chauffeurs
+      // confondus, symetrique de driverFirstShiftDate). Pas encore utilisee
+      // par l'UI mais conservee pour d'eventuelles vues age-du-parc.
+      vehicleFirstShiftDate: vehicleFirstShiftDate ? String(vehicleFirstShiftDate).slice(0, 10) : null,
+      // Disponibles cote nouvelle appli seulement (RAW_CORE_VEHICLE_DAILY
+      // colonnes K/L) — William, 2026-09-02, pour rapprocher visuellement
+      // avec le sheet recrutement dans "Non rattachés".
+      phone: pick(row, ["phone", "Numéro de téléphone"]),
+      licenceNumber: pick(row, ["licenceNumber", "Numéro de permis"]),
+      // William, 2026-09-03 : taille de flotte du MOIS de ce sinistre
+      // (onglet "Parc DTO" cote pipeline) — meme valeur repetee sur chaque
+      // sinistre du mois, voir attachFleetSize dans merge-and-finalize.js.
+      parcDto: (function () { var v = pick(row, ["parcDto", "Parc DTO"]); return v !== null ? Number(v) : null; })(),
+      parcLoc: (function () { var v = pick(row, ["parcLoc", "Parc LOC"]); return v !== null ? Number(v) : null; })(),
+      parcTotal: (function () { var v = pick(row, ["parcTotal", "Parc Total"]); return v !== null ? Number(v) : null; })()
+    };
+  }
+
+  // Anciennete GLOBALE du chauffeur (pas au moment d'un sinistre precis).
+  // Prefere driverFirstShiftDate (vrai minimum tous vehicules confondus,
+  // deja calcule cote pipeline) ; a defaut (enregistrements anciens sans
+  // cette colonne), replie sur l'ancienne approximation : la plus ancienne
+  // firstShiftDate connue sur les seuls enregistrements de sinistre du
+  // chauffeur (William, 2026-08-20, corrige 2026-08-28).
+  function earliestFirstShiftDate(records) {
+    var trueDates = records.map(function (r) { return r.driverFirstShiftDate; }).filter(Boolean);
+    if (trueDates.length > 0) {
+      return trueDates.reduce(function (min, d) { return d < min ? d : min; });
+    }
+    var dates = records.map(function (r) { return r.firstShiftDate; }).filter(Boolean);
+    if (dates.length === 0) return null;
+    return dates.reduce(function (min, d) { return d < min ? d : min; });
+  }
+  function anciennete(minFirstShiftDate) {
+    if (!minFirstShiftDate) return "Inconnue";
+    var todayIso = new Date().toISOString().slice(0, 10);
+    var months = monthsBetween(minFirstShiftDate, todayIso);
+    if (months == null) return "Inconnue";
+    if (months < 3) return "< 3 mois";
+    if (months < 12) return "3-12 mois";
+    if (months < 24) return "1-2 ans";
+    return "2 ans et +";
+  }
+
+  /* =========================================================
+     4. Client-side aggregation (mirrors src/counters-and-ranks.js
+        R3-R5 in spirit, but recomputed on the filtered set so the
+        dashboard reflects whatever period/filters are active).
+     ========================================================= */
+  function withCounters(records) {
+    var byVeh = {}, byDrv = {};
+    records.forEach(function (r) {
+      byVeh[r.plaque] = (byVeh[r.plaque] || 0) + 1;
+      byDrv[r.driverKey] = (byDrv[r.driverKey] || 0) + 1;
+    });
+    // William, 2026-09-03 : rangSinistreVehicule/rangSinistreDriver (1er,
+    // 2e, 3e sinistre... du meme plaque/chauffeur) n'etaient JAMAIS
+    // calcules cote dashboard — seuls les compteurs totaux (nbSinistres*)
+    // l'etaient, malgre un commentaire (faux) affirmant le contraire dans
+    // buildDtoLocAnalysis. Meme algorithme que src/counters-and-ranks.js
+    // (tri par dateReference, rang croissant par cle), recalcule sur la
+    // SELECTION FILTREE actuelle — coherent avec nbSinistres* ci-dessus,
+    // deja filter-scoped. sinistreId sert de cle de correlation (unique,
+    // deja assigne cote pipeline) pour reattacher le rang apres tri.
+    var sorted = records.slice().sort(function (a, b) {
+      return a.dateReference < b.dateReference ? -1 : a.dateReference > b.dateReference ? 1 : 0;
+    });
+    var rangByVeh = {}, rangByDrv = {}, rangBySinistreId = {};
+    sorted.forEach(function (r) {
+      rangByVeh[r.plaque] = (rangByVeh[r.plaque] || 0) + 1;
+      var rangD = null;
+      if (r.driverKey) {
+        rangByDrv[r.driverKey] = (rangByDrv[r.driverKey] || 0) + 1;
+        rangD = rangByDrv[r.driverKey];
+      }
+      rangBySinistreId[r.sinistreId] = { v: rangByVeh[r.plaque], d: rangD };
+    });
+    return records.map(function (r) {
+      var rang = rangBySinistreId[r.sinistreId] || {};
+      return Object.assign({}, r, {
+        nbSinistresVehicule: byVeh[r.plaque],
+        nbSinistresDriver: byDrv[r.driverKey],
+        rangSinistreVehicule: rang.v || null,
+        rangSinistreDriver: rang.d || null
+      });
+    });
+  }
+
+  function applyFilters(records) {
+    var f = state.filters;
+    return records.filter(function (r) {
+      if (f.location !== "all" && r.typeLocation !== f.location) return false;
+      if (f.seniority !== "all" && r.trancheSeniorite !== f.seniority) return false;
+      if (f.from && r.monthKey && r.monthKey < f.from) return false;
+      if (f.to && r.monthKey && r.monthKey > f.to) return false;
+      if (f.churn === "active" && r.hasChurned === true) return false;
+      if (f.churn === "churned" && r.hasChurned !== true) return false;
+      return true;
+    });
+  }
+
+  function fmtDate(iso) {
+    if (!iso) return "—";
+    var p = iso.split("-");
+    return p.length === 3 ? p[2] + "/" + p[1] + "/" + p[0] : iso;
+  }
+  // William, 2026-09-02 : la note de test n'est plus obligatoire pour
+  // rattacher un chauffeur (voir buildRecruitmentIndex) — score peut donc
+  // etre null, affiche explicitement plutot que "null/40".
+  function fmtScore(score) {
+    return score == null ? "pas de note" : score + "/40";
+  }
+  function fmtMonth(mk) {
+    if (!mk) return "—";
+    var m = ["Jan", "Fév", "Mar", "Avr", "Mai", "Jun", "Jul", "Aoû", "Sep", "Oct", "Nov", "Déc"];
+    var parts = mk.split("-");
+    return m[parseInt(parts[1], 10) - 1] + " " + parts[0];
+  }
+  function esc(s) {
+    return String(s).replace(/[&<>"']/g, function (c) {
+      return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c];
+    });
+  }
+
+  /* =========================================================
+     5. Rendering
+     ========================================================= */
+  function render() {
+    renderBanner();
+    var filtered = withCounters(applyFilters(state.records));
+    // William, 2026-09-05 : la delegation d'evenements est cablee UNE FOIS
+    // par panel (wireConfirmButtons) et n'a donc pas acces au `filtered` du
+    // rendu courant — la recherche libre de sinistres en a besoin.
+    state.lastFiltered = filtered;
+    renderKpis(filtered);
+    renderSeniorityOptions();
+    if (state.tab === "drivers") renderDrivers(filtered);
+    if (state.tab === "vehicles") renderVehicles(filtered);
+    if (state.tab === "dtoloc") renderDtoLoc(filtered);
+    if (state.tab === "unmatched") renderUnmatched(filtered);
+    if (state.tab === "declarations") renderDeclarations(filtered);
+    if (state.tab === "rapprochements") renderRapprochements();
+  }
+
+  function renderBanner() {
+    var slot = document.getElementById("banner-slot");
+    if (state.dataMode === "demo") {
+      slot.innerHTML =
+        '<div class="banner warn"><span class="icon">◐</span><div><strong>Jeu de démonstration.</strong> ' +
+        "Aucune donnée live n'a encore été trouvée dans <span class=\"tabular\">Immobilisations_v05/2026</span> " +
+        "(l'exécution Apps Script quotidienne n'a pas encore tourné, ou le connecteur Google Drive n'est pas " +
+        "disponible dans cette session). Les chiffres ci-dessous sont fictifs, pour valider la mise en page." +
+        (state.debugStage ? '<div class="chart-note" style="margin-top:6px"><strong>Diagnostic :</strong> ' + esc(state.debugStage) + "</div>" : "") +
+        "</div></div>";
+    } else if (state.dataMode === "live-partial") {
+      slot.innerHTML =
+        '<div class="banner"><span class="icon">◐</span><div><strong>Données live partielles.</strong> ' +
+        "L'aperçu retourné par le connecteur Drive tronque les très grandes feuilles — seules les premières lignes " +
+        "de <span class=\"tabular\">Immobilisations_v05/2026</span> ont pu être lues. Les compteurs ci-dessous sous-estiment " +
+        "probablement le volume réel.</div></div>";
+    } else if (state.dataMode === "error") {
+      slot.innerHTML =
+        '<div class="banner risk"><span class="icon">⚠</span><div><strong>' + esc(state.lastError || "Lecture live impossible") +
+        "</strong> — affichage du jeu de démonstration en attendant.</div></div>";
+    } else {
+      slot.innerHTML = "";
+    }
+    if (persistError) {
+      slot.innerHTML += '<div class="banner risk"><span class="icon">⚠</span><div>' +
+        esc(persistError) + "</div></div>";
+    }
+  }
+
+  function renderKpis(filtered) {
+    var el = document.getElementById("kpi-row");
+    var totalSinistres = filtered.length;
+    var distinctVeh = new Set(filtered.map(function (r) { return r.plaque; })).size;
+    var tauxGlobal = distinctVeh > 0 ? (totalSinistres / distinctVeh) : 0;
+
+    // "à risque" — >= 2 claims within the 3 months preceding the most
+    // recent claim date in the filtered set (provisional threshold, spec §6).
+    var maxDate = filtered.reduce(function (m, r) { return !m || r.dateReference > m ? r.dateReference : m; }, null);
+    var atRisk = 0;
+    if (maxDate) {
+      var cutoff = new Date(maxDate);
+      cutoff.setMonth(cutoff.getMonth() - 3);
+      var cutoffISO = cutoff.toISOString().slice(0, 10);
+      var counts = {};
+      filtered.forEach(function (r) {
+        if (r.dateReference >= cutoffISO) counts[r.driverKey] = (counts[r.driverKey] || 0) + 1;
+      });
+      atRisk = Object.keys(counts).filter(function (k) { return counts[k] >= 2; }).length;
+    }
+
+    el.innerHTML =
+      kpiCard("Sinistres — période filtrée", totalSinistres, "", "sur " + distinctVeh + " véhicule(s) distinct(s)") +
+      kpiCard("Taux global", tauxGlobal.toFixed(2), "/ véhicule", "sinistres pour un véhicule actif sur la période") +
+      kpiCard("Chauffeurs à risque", atRisk, "", "≥ 2 sinistres sur les 3 derniers mois observés", true);
+  }
+  function kpiCard(label, value, unit, sub, risky) {
+    return '<div class="kpi' + (risky ? " risk" : "") + '"><div class="kpi-label">' + esc(label) +
+      '</div><div class="kpi-value tabular">' + esc(value) + (unit ? '<span class="kpi-unit">' + esc(unit) + "</span>" : "") +
+      '</div><div class="kpi-sub">' + esc(sub) + "</div></div>";
+  }
+
+  function renderSeniorityOptions() {
+    var sel = document.getElementById("f-seniority");
+    if (sel.dataset.built) return;
+    SENIORITY_BUCKETS.concat(["Inconnue"]).forEach(function (b) {
+      var opt = document.createElement("option");
+      opt.value = b; opt.textContent = b;
+      sel.appendChild(opt);
+    });
+    sel.dataset.built = "1";
+  }
+
+  /* ---- Tab: Classement chauffeurs ---- */
+  function renderDrivers(filtered) {
+    var byDriver = {};
+    filtered.forEach(function (r) {
+      if (!byDriver[r.driverKey]) byDriver[r.driverKey] = { name: r.name, driverKey: r.driverKey, records: [] };
+      byDriver[r.driverKey].records.push(r);
+    });
+    var rows = Object.keys(byDriver).map(function (k) {
+      var d = byDriver[k];
+      d.records.sort(function (a, b) { return a.dateReference < b.dateReference ? 1 : -1; });
+      var last = d.records[0];
+      var thisMonth = maxMonth(d.records);
+      var prevMonth = shiftMonth(thisMonth, -1);
+      var countThis = d.records.filter(function (r) { return r.monthKey === thisMonth; }).length;
+      var countPrev = d.records.filter(function (r) { return r.monthKey === prevMonth; }).length;
+      var minFirstShift = earliestFirstShiftDate(d.records);
+      return {
+        driverKey: k,
+        name: d.name,
+        nbSinistresDriver: d.records.length,
+        lastDate: last.dateReference,
+        trend: countThis - countPrev,
+        hasChurned: last.hasChurned,
+        isNew: d.records.some(function (r) { return r.isNew; }),
+        plaques: uniq(d.records.map(function (r) { return r.plaque; })),
+        records: d.records,
+        anciennete: anciennete(minFirstShift)
+      };
+    });
+    sortRows(rows, state.sort.drivers);
+
+    var panel = document.getElementById("panel-drivers");
+    if (rows.length === 0) {
+      panel.innerHTML = emptyState("Aucun chauffeur dans la sélection actuelle. Élargissez les filtres.");
+      return;
+    }
+    panel.innerHTML =
+      tableWrap("drivers", [
+        ["name", "Nom"], ["nbSinistresDriver", "Nb sinistres"], ["lastDate", "Dernier sinistre"],
+        ["trend", "Tendance vs mois préc."], ["anciennete", "Ancienneté"], ["hasChurned", "Statut churn"]
+      ], rows.map(function (r) {
+        return "<tr class=\"clickable" + (state.expandedDriver === r.driverKey ? " expanded" : "") + "\" data-driver=\"" + esc(r.driverKey) + "\">" +
+          "<td class=\"name-cell\">" + esc(r.name) + (r.isNew ? ' <span class="pill new">Nouveau</span>' : "") + "</td>" +
+          "<td class=\"tabular\">" + r.nbSinistresDriver + "</td>" +
+          "<td class=\"tabular muted\">" + fmtDate(r.lastDate) + "</td>" +
+          "<td>" + trendPill(r.trend) + "</td>" +
+          "<td class=\"muted\">" + esc(r.anciennete) + "</td>" +
+          "<td>" + churnPill(r.hasChurned) + "</td></tr>";
+      }).join(""));
+
+    bindSort("drivers", render);
+    panel.querySelectorAll("tr[data-driver]").forEach(function (tr) {
+      tr.addEventListener("click", function () {
+        var key = tr.getAttribute("data-driver");
+        state.expandedDriver = state.expandedDriver === key ? null : key;
+        renderDrivers(filtered);
+      });
+    });
+
+    if (state.expandedDriver && byDriver[state.expandedDriver]) {
+      var d = byDriver[state.expandedDriver];
+      var hist = d.records.slice().sort(function (a, b) { return a.dateReference < b.dateReference ? 1 : -1; });
+      var plaques = uniq(d.records.map(function (r) { return r.plaque; }));
+      var wrap = document.createElement("div");
+      wrap.className = "detail";
+      wrap.innerHTML =
+        '<button class="detail-close" type="button">Fermer ✕</button>' +
+        "<h3>" + esc(d.name) + "</h3>" +
+        '<div class="detail-sub">' + hist.length + " sinistre(s) dans la sélection actuelle</div>" +
+        '<div class="chips">' + plaques.map(function (p) { return '<span class="chip">' + esc(p) + "</span>"; }).join("") + "</div>" +
+        '<ul class="history">' + hist.map(function (r) {
+          return "<li><span>" + fmtDate(r.dateReference) + " — " + esc(r.plaque) + "</span><span class=\"muted\">" +
+            (typeLocLabel(r.typeLocation)) + (r.dureeDesTravaux != null ? " · " + r.dureeDesTravaux + "j immobilisation" : "") + "</span></li>";
+        }).join("") + "</ul>";
+      panel.appendChild(wrap);
+      wrap.querySelector(".detail-close").addEventListener("click", function () {
+        state.expandedDriver = null;
+        renderDrivers(filtered);
+      });
+    }
+  }
+
+  /* ---- Tab: Vue véhicule ---- */
+  function renderVehicles(filtered) {
+    var byVeh = {};
+    filtered.forEach(function (r) {
+      if (!byVeh[r.plaque]) byVeh[r.plaque] = { plaque: r.plaque, records: [] };
+      byVeh[r.plaque].records.push(r);
+    });
+    var rows = Object.keys(byVeh).map(function (k) {
+      var v = byVeh[k];
+      v.records.sort(function (a, b) { return a.dateReference < b.dateReference ? 1 : -1; });
+      var downtime = v.records.reduce(function (s, r) { return s + (r.dureeDesTravaux || 0); }, 0);
+      var locCounts = {};
+      v.records.forEach(function (r) { locCounts[r.typeLocation] = (locCounts[r.typeLocation] || 0) + 1; });
+      var mainLoc = Object.keys(locCounts).sort(function (a, b) { return locCounts[b] - locCounts[a]; })[0];
+      return {
+        plaque: k,
+        nbSinistresVehicule: v.records.length,
+        downtime: downtime,
+        typeLocation: mainLoc,
+        lastDate: v.records[0].dateReference,
+        records: v.records
+      };
+    });
+    sortRows(rows, state.sort.vehicles);
+
+    var panel = document.getElementById("panel-vehicles");
+    if (rows.length === 0) {
+      panel.innerHTML = emptyState("Aucun véhicule dans la sélection actuelle. Élargissez les filtres.");
+      return;
+    }
+    panel.innerHTML =
+      tableWrap("vehicles", [
+        ["plaque", "Plaque"], ["nbSinistresVehicule", "Nb sinistres"], ["downtime", "Jours immobilisation"],
+        ["typeLocation", "Type de location"], ["lastDate", "Dernier sinistre"]
+      ], rows.map(function (r) {
+        return "<tr class=\"clickable" + (state.expandedVehicle === r.plaque ? " expanded" : "") + "\" data-veh=\"" + esc(r.plaque) + "\">" +
+          '<td class="name-cell tabular">' + esc(r.plaque) + "</td>" +
+          '<td class="tabular">' + r.nbSinistresVehicule + "</td>" +
+          '<td class="tabular">' + r.downtime + "</td>" +
+          "<td>" + typeLocPill(r.typeLocation) + "</td>" +
+          '<td class="tabular muted">' + fmtDate(r.lastDate) + "</td></tr>";
+      }).join(""));
+
+    bindSort("vehicles", render);
+    panel.querySelectorAll("tr[data-veh]").forEach(function (tr) {
+      tr.addEventListener("click", function () {
+        var key = tr.getAttribute("data-veh");
+        state.expandedVehicle = state.expandedVehicle === key ? null : key;
+        renderVehicles(filtered);
+      });
+    });
+
+    if (state.expandedVehicle && byVeh[state.expandedVehicle]) {
+      var v = byVeh[state.expandedVehicle];
+      var wrap = document.createElement("div");
+      wrap.className = "detail";
+      wrap.innerHTML =
+        '<button class="detail-close" type="button">Fermer ✕</button>' +
+        "<h3>" + esc(v.plaque) + "</h3>" +
+        '<div class="detail-sub">' + v.records.length + " sinistre(s) dans la sélection actuelle</div>" +
+        '<ul class="history">' + v.records.map(function (r) {
+          return "<li><span>" + fmtDate(r.dateReference) + " — " + esc(r.name) + "</span><span class=\"muted\">" +
+            (r.dureeDesTravaux != null ? r.dureeDesTravaux + "j" : "—") + "</span></li>";
+        }).join("") + "</ul>";
+      panel.appendChild(wrap);
+      wrap.querySelector(".detail-close").addEventListener("click", function () {
+        state.expandedVehicle = null;
+        renderVehicles(filtered);
+      });
+    }
+  }
+
+  function chartCard(title, note, body) {
+    return '<div class="chart-card"><h3>' + esc(title) + '</h3><div class="chart-note">' + esc(note) + "</div>" + body + "</div>";
+  }
+
+  /* =========================================================
+     Tab: DTO vs Location — William, 2026-09-02, reprend les graphiques
+     du deck de reference (recidive, seniorite, duree d'immobilisation).
+     Les graphiques bases sur une taille de flotte historique par mois/type
+     (taux normalise, repartition de la flotte) restent hors scope pour
+     l'instant, faute de connecteur — voir buildDtoLocAnalysis.
+     ========================================================= */
+
+  // Regroupe les sinistres filtres par mois x type de location, et
+  // precalcule tout ce dont les graphiques de cet onglet ont besoin.
+  function buildDtoLocAnalysis(filtered) {
+    var byMonth = {};
+    filtered.forEach(function (r) {
+      var mk = r.monthKey;
+      if (!mk) return;
+      if (!byMonth[mk]) byMonth[mk] = { dto: [], loc: [], vide: [] };
+      var bucket = r.typeLocation === "DTO" ? "dto" : (r.typeLocation === "LOC" ? "loc" : "vide");
+      byMonth[mk][bucket].push(r);
+    });
+    var months = Object.keys(byMonth).sort();
+
+    // 1er/2e/3e/4e-et-plus sinistre du MEME chauffeur, sur toute la
+    // selection filtree (rangSinistreDriver, deja calcule par withCounters).
+    function rangBucket(rang) {
+      if (!rang || rang <= 1) return 1;
+      if (rang >= 4) return 4;
+      return rang;
+    }
+    function rangCounts(list) {
+      var c = { 1: 0, 2: 0, 3: 0, 4: 0 };
+      list.forEach(function (r) { c[rangBucket(r.rangSinistreDriver)]++; });
+      return c;
+    }
+    function recidiveCount(list) { return list.filter(function (r) { return r.rangSinistreDriver > 1; }).length; }
+    // "0-3 mois" : valeur exacte ecrite par le pipeline (trancheSeniorite_
+    // dans src/merge-and-finalize.js), ou repli client (deriveSeniority,
+    // corrige le 2026-09-03) quand la colonne serveur est encore vide —
+    // les deux utilisent desormais le meme schema a 5 tranches, ce filtre
+    // les capte donc bien dans les deux cas.
+    function under3moCount(list) { return list.filter(function (r) { return r.trancheSeniorite === "0-3 mois"; }).length; }
+    function avgDuree(list) {
+      var withDuree = list.filter(function (r) { return r.dureeDesTravaux != null; });
+      if (!withDuree.length) return null;
+      return withDuree.reduce(function (s, r) { return s + r.dureeDesTravaux; }, 0) / withDuree.length;
+    }
+    var SENIORITY_TRANCHES = ["0-3 mois", "3-6 mois", "6-12 mois", "12-24 mois", "24-48 mois"];
+    function seniorityBreakdown(list) {
+      var counts = {};
+      SENIORITY_TRANCHES.forEach(function (t) { counts[t] = 0; });
+      list.forEach(function (r) { if (counts.hasOwnProperty(r.trancheSeniorite)) counts[r.trancheSeniorite]++; });
+      return counts;
+    }
+
+    // William, 2026-09-03 : taille de flotte du mois (onglet "Parc DTO"
+    // cote pipeline, deja attachee a chaque enregistrement — meme valeur
+    // repetee sur tous les sinistres du mois, on prend juste le premier
+    // trouve). Peut manquer (mois hors couverture de "Parc DTO", ou
+    // aucun sinistre ce mois-la dans la selection filtree).
+    function fleetSizeOf(list) {
+      var withFleet = list.filter(function (r) { return r.parcTotal != null; })[0];
+      return withFleet ? { dto: withFleet.parcDto, loc: withFleet.parcLoc, total: withFleet.parcTotal } : null;
+    }
+
+    return months.map(function (mk) {
+      var b = byMonth[mk];
+      var all = b.dto.concat(b.loc).concat(b.vide);
+      var fleet = fleetSizeOf(all);
+      return {
+        month: mk,
+        dtoCount: b.dto.length, locCount: b.loc.length, videCount: b.vide.length,
+        dtoRangCounts: rangCounts(b.dto), locRangCounts: rangCounts(b.loc),
+        dtoRecidiveCount: recidiveCount(b.dto), locRecidiveCount: recidiveCount(b.loc),
+        dtoRecidiveShare: b.dto.length ? recidiveCount(b.dto) / b.dto.length : 0,
+        locRecidiveShare: b.loc.length ? recidiveCount(b.loc) / b.loc.length : 0,
+        dtoUnder3moShare: b.dto.length ? under3moCount(b.dto) / b.dto.length : 0,
+        locUnder3moShare: b.loc.length ? under3moCount(b.loc) / b.loc.length : 0,
+        dtoAvgDuree: avgDuree(b.dto), locAvgDuree: avgDuree(b.loc),
+        dtoSeniorityBreakdown: seniorityBreakdown(b.dto),
+        fleetDto: fleet ? fleet.dto : null,
+        fleetLoc: fleet ? fleet.loc : null,
+        fleetTotal: fleet ? fleet.total : null,
+        dtoRatePerFleet: fleet && fleet.dto ? b.dto.length / fleet.dto : null,
+        locRatePerFleet: fleet && fleet.loc ? b.loc.length / fleet.loc : null
+      };
+    });
+  }
+
+  /* ---- Primitives de graphiques generiques (reutilisees par les 13
+     graphiques de cet onglet — memes tokens visuels que volumeChart/
+     rateChart/recidivistChart, juste parametrees par une liste de series
+     plutot que codees en dur pour DTO/LOC). ---- */
+
+  // William, 2026-09-05 : les trois primitives ci-dessous appellent
+  // wireMonthClicks apres insertion (setTimeout) — mais la fonction n'avait
+  // jamais ete ecrite : chaque rendu de graphique levait un ReferenceError
+  // dans un timer (invisible a l'ecran, d'ou le fait que ca soit passe
+  // inapercu, mais aucun clic sur un mois ne faisait quoi que ce soit alors
+  // que le curseur .bar-clickable et les <title> le promettent).
+  // Comportement : cliquer un mois restreint la periode a ce mois ; re-cliquer
+  // le meme mois annule la restriction.
+  function wireMonthClicks(svg) {
+    if (!svg) return;
+    svg.querySelectorAll("[data-month]").forEach(function (g) {
+      g.addEventListener("click", function () {
+        var mk = g.getAttribute("data-month");
+        var already = state.filters.from === mk && state.filters.to === mk;
+        state.filters.from = already ? "" : mk;
+        state.filters.to = already ? "" : mk;
+        document.getElementById("f-from").value = state.filters.from;
+        document.getElementById("f-to").value = state.filters.to;
+        render();
+      });
+    });
+  }
+
+  // Barres empilees (absolu ou 100%). data: [{month, values:{key:n}}],
+  // series: [{key,label,color}].
+  function stackedBarChartGeneric(data, series, opts) {
+    opts = opts || {};
+    var w = Math.max(560, data.length * 64), h = opts.height || 220, padL = 36, padB = 26, padT = 10;
+    var normalize = !!opts.normalize;
+    var totals = data.map(function (d) {
+      return series.reduce(function (s, sr) { return s + (d.values[sr.key] || 0); }, 0);
+    });
+    var maxVal = normalize ? 1 : Math.max(1, Math.max.apply(null, totals));
+    var bw = (w - padL - 12) / data.length;
+    var bars = data.map(function (d, i) {
+      var x = padL + i * bw + bw * 0.18;
+      var barW = bw * 0.64;
+      var total = totals[i];
+      var yBase = h - padB;
+      var yCursor = yBase;
+      var segs = series.map(function (sr) {
+        var raw = d.values[sr.key] || 0;
+        var val = normalize ? (total > 0 ? raw / total : 0) : raw;
+        var segH = (h - padB - padT) * (val / maxVal);
+        var y = yCursor - segH;
+        yCursor = y;
+        if (segH <= 0.5) return "";
+        var label = normalize ? (raw > 0 ? Math.round((raw / (total || 1)) * 100) + "%" : "") : (raw > 0 ? String(raw) : "");
+        return '<rect x="' + x + '" y="' + y + '" width="' + barW + '" height="' + segH + '" fill="' + sr.color + '"></rect>' +
+          (segH > 14 && label ? '<text class="value-label" x="' + (x + barW / 2) + '" y="' + (y + segH / 2 + 4) + '" text-anchor="middle" fill="#fff" style="font-weight:600">' + label + "</text>" : "");
+      }).join("");
+      var tip = esc(fmtMonth(d.month)) + " — " + series.map(function (sr) { return sr.label + ": " + (d.values[sr.key] || 0); }).join(", ");
+      var topLabel = (!normalize && total > 0) ? '<text class="value-label" x="' + (x + barW / 2) + '" y="' + (yCursor - 6) + '" text-anchor="middle">' + total + "</text>" : "";
+      return '<g class="bar-clickable" data-month="' + esc(d.month) + '"><title>' + tip + "</title>" +
+        '<rect x="' + x + '" y="' + padT + '" width="' + barW + '" height="' + (h - padB - padT) + '" fill="transparent"></rect>' +
+        segs + topLabel + "</g>" +
+        '<text class="axis-label" x="' + (x + barW / 2) + '" y="' + (h - 8) + '" text-anchor="middle">' + esc(fmtMonth(d.month)) + "</text>";
+    }).join("");
+    var gridLines = [0, 0.5, 1].map(function (frac) {
+      var y = padT + (h - padB - padT) * (1 - frac);
+      var label = normalize ? Math.round(frac * 100) + "%" : Math.round(maxVal * frac);
+      return '<line class="grid-line" x1="' + padL + '" x2="' + (w - 8) + '" y1="' + y + '" y2="' + y + '"></line>' +
+        '<text class="axis-label" x="' + (padL - 6) + '" y="' + (y + 3) + '" text-anchor="end">' + label + "</text>";
+    }).join("");
+    var legend = '<div class="legend">' + series.map(function (sr) {
+      return '<span><span class="swatch" style="background:' + sr.color + '"></span>' + esc(sr.label) + "</span>";
+    }).join("") + "</div>";
+    var id = "svg-gen-" + Math.random().toString(36).slice(2);
+    setTimeout(function () { wireMonthClicks(document.getElementById(id)); }, 0);
+    return chartCard(opts.title || "", opts.note || "",
+      legend + '<div class="chart-scroll"><svg id="' + id + '" class="chart" viewBox="0 0 ' + w + " " + h + '" width="' + w + '" height="' + h + '">' + gridLines + bars + "</svg></div>"
+    );
+  }
+
+  // Lignes multi-series (absolu ou %). data: [{month, values:{key:n}}],
+  // series: [{key,label,color}].
+  function lineChartGeneric(data, series, opts) {
+    opts = opts || {};
+    var w = Math.max(560, data.length * 64), h = opts.height || 200, padL = 36, padB = 26, padT = 10;
+    var percent = !!opts.percent;
+    var allVals = [];
+    data.forEach(function (d) { series.forEach(function (sr) { allVals.push(d.values[sr.key] || 0); }); });
+    var maxVal = percent ? 1 : Math.max(0.1, Math.max.apply(null, allVals.concat([0.1])));
+    var step = (w - padL - 24) / Math.max(1, data.length - 1);
+
+    var gridLines = [0, 0.5, 1].map(function (frac) {
+      var y = padT + (h - padB - padT) * (1 - frac);
+      var label = percent ? Math.round(maxVal * frac * 100) + "%" : Math.round(maxVal * frac * 10) / 10;
+      return '<line class="grid-line" x1="' + padL + '" x2="' + (w - 8) + '" y1="' + y + '" y2="' + y + '"></line>' +
+        '<text class="axis-label" x="' + (padL - 6) + '" y="' + (y + 3) + '" text-anchor="end">' + label + "</text>";
+    }).join("");
+
+    var seriesSvg = series.map(function (sr) {
+      var points = data.map(function (d, i) {
+        var v = d.values[sr.key] || 0;
+        var x = padL + i * step;
+        var y = padT + (h - padB - padT) * (1 - v / maxVal);
+        return { x: x, y: y, v: v, d: d };
+      });
+      var path = points.map(function (p, i) { return (i === 0 ? "M" : "L") + p.x.toFixed(1) + " " + p.y.toFixed(1); }).join(" ");
+      var dots = points.map(function (p) {
+        var label = percent ? Math.round(p.v * 100) + "%" : (Math.round(p.v * 10) / 10);
+        var tip = esc(fmtMonth(p.d.month)) + " — " + sr.label + ": " + label;
+        return '<g class="bar-clickable" data-month="' + esc(p.d.month) + '"><title>' + tip + "</title>" +
+          '<circle cx="' + p.x + '" cy="' + p.y + '" r="9" fill="transparent"></circle>' +
+          '<circle cx="' + p.x + '" cy="' + p.y + '" r="3.2" fill="' + sr.color + '"></circle>' +
+          '<text class="value-label" x="' + p.x + '" y="' + (p.y - 10) + '" text-anchor="middle">' + label + "</text></g>";
+      }).join("");
+      return '<path fill="none" stroke="' + sr.color + '" stroke-width="2" d="' + path + '"></path>' + dots;
+    }).join("");
+
+    var axisLabels = data.map(function (d, i) {
+      var x = padL + i * step;
+      return '<text class="axis-label" x="' + x + '" y="' + (h - 8) + '" text-anchor="middle">' + esc(fmtMonth(d.month)) + "</text>";
+    }).join("");
+
+    var legend = '<div class="legend">' + series.map(function (sr) {
+      return '<span><span class="swatch" style="background:' + sr.color + '"></span>' + esc(sr.label) + "</span>";
+    }).join("") + "</div>";
+    var id = "svg-gen-" + Math.random().toString(36).slice(2);
+    setTimeout(function () { wireMonthClicks(document.getElementById(id)); }, 0);
+    return chartCard(opts.title || "", opts.note || "",
+      legend + '<div class="chart-scroll"><svg id="' + id + '" class="chart" viewBox="0 0 ' + w + " " + h + '" width="' + w + '" height="' + h + '">' + gridLines + seriesSvg + axisLabels + "</svg></div>"
+    );
+  }
+
+  // Barres groupees cote-a-cote (pas empilees) — 2 series/mois, ex: duree
+  // moyenne d'immobilisation DTO vs LOC. data: [{month, values:{key:n|null}}].
+  function groupedBarChartGeneric(data, series, opts) {
+    opts = opts || {};
+    var w = Math.max(560, data.length * 76), h = opts.height || 200, padL = 40, padB = 26, padT = 10;
+    var percent = !!opts.percent;
+    var allVals = [];
+    data.forEach(function (d) { series.forEach(function (sr) { var v = d.values[sr.key]; if (v != null) allVals.push(v); }); });
+    var maxVal = percent ? Math.max(0.01, Math.max.apply(null, allVals.concat([0.01]))) : Math.max(1, Math.max.apply(null, allVals.concat([1])));
+    var fmtVal = function (v) { return percent ? Math.round(v * 100) + "%" : (Math.round(v * 10) / 10); };
+    var groupW = (w - padL - 12) / data.length;
+    var barW = (groupW * 0.7) / series.length;
+    var bars = data.map(function (d, i) {
+      var gx = padL + i * groupW + groupW * 0.15;
+      var segs = series.map(function (sr, si) {
+        var v = d.values[sr.key];
+        if (v == null) return "";
+        var x = gx + si * barW;
+        var segH = (h - padB - padT) * (v / maxVal);
+        var y = h - padB - segH;
+        return '<rect x="' + x + '" y="' + y + '" width="' + (barW * 0.86) + '" height="' + segH + '" fill="' + sr.color + '"></rect>' +
+          '<text class="value-label" x="' + (x + barW * 0.43) + '" y="' + (y - 6) + '" text-anchor="middle">' + fmtVal(v) + "</text>";
+      }).join("");
+      var tip = esc(fmtMonth(d.month)) + " — " + series.map(function (sr) {
+        var v = d.values[sr.key];
+        return sr.label + ": " + (v != null ? fmtVal(v) : "—");
+      }).join(", ");
+      return '<g class="bar-clickable" data-month="' + esc(d.month) + '"><title>' + tip + "</title>" +
+        '<rect x="' + gx + '" y="' + padT + '" width="' + (groupW * 0.7) + '" height="' + (h - padB - padT) + '" fill="transparent"></rect>' +
+        segs + "</g>" +
+        '<text class="axis-label" x="' + (gx + groupW * 0.35) + '" y="' + (h - 8) + '" text-anchor="middle">' + esc(fmtMonth(d.month)) + "</text>";
+    }).join("");
+    var gridLines = [0, 0.5, 1].map(function (frac) {
+      var y = padT + (h - padB - padT) * (1 - frac);
+      return '<line class="grid-line" x1="' + padL + '" x2="' + (w - 8) + '" y1="' + y + '" y2="' + y + '"></line>' +
+        '<text class="axis-label" x="' + (padL - 6) + '" y="' + (y + 3) + '" text-anchor="end">' + fmtVal(maxVal * frac) + "</text>";
+    }).join("");
+    var legend = '<div class="legend">' + series.map(function (sr) {
+      return '<span><span class="swatch" style="background:' + sr.color + '"></span>' + esc(sr.label) + "</span>";
+    }).join("") + "</div>";
+    var id = "svg-gen-" + Math.random().toString(36).slice(2);
+    setTimeout(function () { wireMonthClicks(document.getElementById(id)); }, 0);
+    return chartCard(opts.title || "", opts.note || "",
+      legend + '<div class="chart-scroll"><svg id="' + id + '" class="chart" viewBox="0 0 ' + w + " " + h + '" width="' + w + '" height="' + h + '">' + gridLines + bars + "</svg></div>"
+    );
+  }
+
+  function renderDtoLoc(filtered) {
+    var panel = document.getElementById("panel-dtoloc");
+    var data = buildDtoLocAnalysis(filtered);
+    if (data.length === 0) {
+      panel.innerHTML = emptyState("Aucune donnée sur la sélection actuelle. Élargissez les filtres.");
+      return;
+    }
+
+    var COL_DTO = "var(--accent)", COL_LOC = "var(--warn)", COL_VIDE = "var(--ink-faint)";
+    var RANG_SERIES = [
+      { key: "1", label: "1er sinistre", color: "var(--sev-1)" },
+      { key: "2", label: "2e sinistre", color: "var(--sev-2)" },
+      { key: "3", label: "3e sinistre", color: "var(--sev-3)" },
+      { key: "4", label: "4e sinistre et +", color: "var(--sev-4)" }
+    ];
+    function rangValues(counts) { return { "1": counts[1], "2": counts[2], "3": counts[3], "4": counts[4] }; }
+
+    var volumeData = data.map(function (d) { return { month: d.month, values: { dto: d.dtoCount, loc: d.locCount, vide: d.videCount } }; });
+    var volumeSeries = [
+      { key: "dto", label: "DTO", color: COL_DTO },
+      { key: "loc", label: "Location", color: COL_LOC },
+      { key: "vide", label: "Vide/Inconnu", color: COL_VIDE }
+    ];
+
+    var dtoLineData = data.map(function (d) { return { month: d.month, values: { dto: d.dtoCount, loc: d.locCount } }; });
+    var dtoLocSeries2 = [{ key: "dto", label: "DTO", color: COL_DTO }, { key: "loc", label: "Location", color: COL_LOC }];
+
+    // William, 2026-09-03 : taille de flotte (onglet "Parc DTO") — un mois
+    // sans donnee de flotte (fleetDto/fleetLoc null) tombe a 0 plutot que
+    // de casser le graphique ; ca se voit comme un creux, pas une erreur.
+    var fleetCompositionData = data.map(function (d) { return { month: d.month, values: { dto: d.fleetDto, loc: d.fleetLoc } }; });
+    var fleetRateData = data.map(function (d) { return { month: d.month, values: { dto: d.dtoRatePerFleet || 0, loc: d.locRatePerFleet || 0 } }; });
+
+    var recidiveShareData = data.map(function (d) { return { month: d.month, values: { dto: d.dtoRecidiveShare, loc: d.locRecidiveShare } }; });
+    var recidiveCountData = data.map(function (d) { return { month: d.month, values: { dto: d.dtoRecidiveCount, loc: d.locRecidiveCount } }; });
+    var under3moData = data.map(function (d) { return { month: d.month, values: { dto: d.dtoUnder3moShare, loc: d.locUnder3moShare } }; });
+    var dureeData = data.map(function (d) { return { month: d.month, values: { dto: d.dtoAvgDuree, loc: d.locAvgDuree } }; });
+
+    var dtoRangShareData = data.map(function (d) { return { month: d.month, values: rangValues(d.dtoRangCounts) }; });
+    var locRangShareData = data.map(function (d) { return { month: d.month, values: rangValues(d.locRangCounts) }; });
+
+    var senioritySeries = ["0-3 mois", "3-6 mois", "6-12 mois", "12-24 mois", "24-48 mois"].map(function (t, i) {
+      return { key: t, label: t, color: ["var(--sev-4)", "var(--warn)", "var(--good)", "var(--accent)", "var(--new-dot)"][i] };
+    });
+    var seniorityData = data.map(function (d) {
+      var v = {};
+      senioritySeries.forEach(function (sr) { v[sr.key] = d.dtoSeniorityBreakdown[sr.key]; });
+      return { month: d.month, values: v };
+    });
+
+    panel.innerHTML =
+      stackedBarChartGeneric(volumeData, volumeSeries, {
+        title: "Nombre de sinistres par type de location",
+        note: "Empilé par mois — DTO, Location, et véhicules sans type identifié."
+      }) +
+      stackedBarChartGeneric(volumeData, volumeSeries, {
+        normalize: true,
+        title: "Nombre de sinistres par type de location (%)",
+        note: "Même donnée que ci-dessus, en part relative par mois."
+      }) +
+      lineChartGeneric(dtoLineData, dtoLocSeries2, {
+        title: "Évolution du nombre de sinistres — DTO vs Location",
+        note: "Compte brut de sinistres par mois, par type de location."
+      }) +
+      stackedBarChartGeneric(fleetCompositionData, dtoLocSeries2, {
+        title: "Répartition de la flotte par type (volume)",
+        note: "Nombre de véhicules DTO vs Location par mois (onglet \"Parc DTO\"), en effectif brut."
+      }) +
+      stackedBarChartGeneric(fleetCompositionData, dtoLocSeries2, {
+        normalize: true,
+        title: "Répartition de la flotte par type (%)",
+        note: "Même donnée que ci-dessus, en part relative par mois."
+      }) +
+      groupedBarChartGeneric(fleetRateData, dtoLocSeries2, {
+        percent: true,
+        title: "Taux de sinistres normalisé par type de contrat",
+        note: "Nombre de sinistres du mois ÷ taille de la flotte de ce type ce mois-là (onglet \"Parc DTO\") — permet de comparer DTO et Location indépendamment de la taille relative de chaque parc."
+      }) +
+      lineChartGeneric(fleetRateData, dtoLocSeries2, {
+        percent: true,
+        title: "Taux de sinistres normalisé par type de contrat (Tendance)",
+        note: "Même donnée que ci-dessus, en tendance mensuelle."
+      }) +
+      lineChartGeneric(recidiveShareData, dtoLocSeries2, {
+        percent: true,
+        title: "Part de récidive dans les sinistres — DTO vs Location",
+        note: "Part des sinistres du mois dont le chauffeur avait déjà eu au moins un sinistre auparavant (sur la période filtrée)."
+      }) +
+      lineChartGeneric(recidiveCountData, dtoLocSeries2, {
+        title: "Nombre de récidives — DTO vs Location",
+        note: "Compte brut de sinistres impliquant un chauffeur déjà récidiviste, par mois et type de location."
+      }) +
+      lineChartGeneric(under3moData, dtoLocSeries2, {
+        percent: true,
+        title: "Part des conducteurs de < 3 mois d'ancienneté dans les sinistres — DTO vs Location",
+        note: "Part des sinistres du mois impliquant un chauffeur dont l'ancienneté (voir Driver First Shift Date) est inférieure à 3 mois."
+      }) +
+      stackedBarChartGeneric(seniorityData, senioritySeries, {
+        normalize: true,
+        title: "Répartition sinistres DTO par séniorité conducteur (%)",
+        note: "Sinistres DTO uniquement, répartis par tranche d'ancienneté du chauffeur au moment du sinistre."
+      }) +
+      groupedBarChartGeneric(dureeData, dtoLocSeries2, {
+        title: "Durée moyenne d'immobilisation",
+        note: "Moyenne de \"Duree Des Travaux\" (jours), par mois et type de location."
+      }) +
+      stackedBarChartGeneric(dtoRangShareData, RANG_SERIES, {
+        normalize: true,
+        title: "Évolution des récidives — DTO (%)",
+        note: "Sinistres DTO répartis par rang (1er, 2e, 3e, 4e sinistre et plus) du même chauffeur, par mois. Ne couvre que DTO — le total diffère donc volontairement de \"Nombre de sinistres par type de location\" (qui inclut aussi Location et Vide/Inconnu)."
+      }) +
+      stackedBarChartGeneric(locRangShareData, RANG_SERIES, {
+        normalize: true,
+        title: "Évolution des récidives — Location (%)",
+        note: "Sinistres Location répartis par rang (1er, 2e, 3e, 4e sinistre et plus) du même chauffeur, par mois. Ne couvre que Location — le total diffère donc volontairement de \"Nombre de sinistres par type de location\" (qui inclut aussi DTO et Vide/Inconnu)."
+      }) +
+      stackedBarChartGeneric(dtoRangShareData, RANG_SERIES, {
+        title: "Évolution des récidives — DTO (nombre)",
+        note: "Même donnée que ci-dessus (part relative), en nombre brut."
+      }) +
+      stackedBarChartGeneric(locRangShareData, RANG_SERIES, {
+        title: "Évolution des récidives — Location (nombre)",
+        note: "Même donnée que ci-dessus (part relative), en nombre brut."
+      });
+  }
+
+  /* ---- Tab: Recrutement (score de test vs accidentalité) ---- */
+  var SCORE_BUCKETS = [
+    { label: "0-10", min: 0, max: 10 },
+    { label: "10-20", min: 10, max: 20 },
+    { label: "20-30", min: 20, max: 30 },
+    { label: "30-40", min: 30, max: 41 }
+  ];
+
+  // Calcule le rapprochement sinistres <-> recrutement pour la selection
+  // filtree actuelle. Utilise par renderUnmatched (l'onglet "Recrutement"
+  // qui consommait aussi cette fonction a ete retire le 2026-09-02) — les
+  // seaux de score (SCORE_BUCKETS/data) restent calcules mais ne sont plus
+  // affiches, sans impact fonctionnel sur "Non rattachés".
+  function computeRecruitmentMatch(filtered) {
+    var byKey = state.recruitment.byKey || {};
+    var sinistresByKey = {}, nameByKey = {}, firstShiftByKey = {}, phoneByKey = {}, licenceByKey = {};
+    filtered.forEach(function (r) {
+      sinistresByKey[r.driverKey] = (sinistresByKey[r.driverKey] || 0) + 1;
+      nameByKey[r.driverKey] = r.name;
+      // Prefere la vraie date de premier shift chauffeur (driverFirstShiftDate,
+      // tous vehicules confondus) ; a defaut, replie sur l'approximation
+      // historique (firstShiftDate, scope vehicule+chauffeur) pour les
+      // enregistrements sans cette colonne. William, 2026-08-28.
+      var candidateFirstShift = r.driverFirstShiftDate || r.firstShiftDate;
+      if (candidateFirstShift && (!firstShiftByKey[r.driverKey] || candidateFirstShift < firstShiftByKey[r.driverKey])) {
+        firstShiftByKey[r.driverKey] = candidateFirstShift;
+      }
+      // Telephone/permis cote sinistres (RAW_CORE_VEHICLE_DAILY, nouvelle
+      // appli seulement) — William, 2026-09-02, pour rapprochement manuel.
+      // Stable par chauffeur : on garde la premiere valeur non-vide trouvee.
+      if (r.phone && !phoneByKey[r.driverKey]) phoneByKey[r.driverKey] = r.phone;
+      if (r.licenceNumber && !licenceByKey[r.driverKey]) licenceByKey[r.driverKey] = r.licenceNumber;
+    });
+
+    var buckets = SCORE_BUCKETS.map(function (b) { return Object.assign({}, b, { drivers: 0, sinistres: 0 }); });
+    var counts = { exact: 0, alias: 0, ambiguous: 0, none: 0 };
+    var unmatchedDrivers = [];
+    var usedRecruitmentKeys = {};
+
+    function addToBucket(score, nbSinistres) {
+      // William, 2026-09-02 : score peut desormais etre null (chauffeur
+      // recrutement sans note, rattachable quand meme) — jamais compare
+      // numeriquement (null >= 0 vaudrait true et tomberait a tort dans la
+      // premiere tranche), simplement exclu du graphique note/accidentalite.
+      if (score == null) return;
+      var bucket = buckets.filter(function (b) { return score >= b.min && score < b.max; })[0];
+      if (!bucket) return;
+      bucket.drivers++;
+      bucket.sinistres += nbSinistres;
+    }
+
+    Object.keys(sinistresByKey).forEach(function (driverKey) {
+      var m = lookupRecruitment(driverKey);
+      counts[m.confidence]++;
+      if (m.confidence === "exact" || m.confidence === "alias") {
+        usedRecruitmentKeys[ALIAS_MAP[driverKey] || driverKey] = true;
+        addToBucket(m.score, sinistresByKey[driverKey]);
+      } else if (m.confidence === "none") {
+        unmatchedDrivers.push({
+          driverKey: driverKey, name: nameByKey[driverKey], nbSinistres: sinistresByKey[driverKey],
+          firstShiftDate: firstShiftByKey[driverKey] || null,
+          phone: phoneByKey[driverKey] || null,
+          licenceNumber: licenceByKey[driverKey] || null
+        });
+      }
+      // "ambiguous" : ni bucketise, ni compte comme "non rattache" (on sait
+      // qu'une correspondance existe, juste pas laquelle) — visible dans
+      // l'onglet "Non rattachés" a part.
+    });
+
+    // Chauffeurs recrutement sans AUCUN sinistre dans la selection : on les
+    // ajoute quand meme (avec 0 sinistre) pour que la moyenne par tranche
+    // reflete un vrai taux d'accidentalite, pas seulement les deja-accidentes.
+    var ambiguousRecruitment = [];
+    Object.keys(byKey).forEach(function (key) {
+      var entry = byKey[key];
+      if (entry.distinctPeople > 1) {
+        if (!usedRecruitmentKeys[key]) ambiguousRecruitment.push({ key: key, distinctPeople: entry.distinctPeople, score: entry.score });
+        return;
+      }
+      if (usedRecruitmentKeys[key]) return; // deja compte via un chauffeur sinistre ci-dessus
+      addToBucket(entry.score, 0);
+    });
+
+    var data = buckets.map(function (b) {
+      return { label: b.label, drivers: b.drivers, avg: b.drivers ? b.sinistres / b.drivers : 0 };
+    });
+
+    return { data: data, counts: counts, unmatchedDrivers: unmatchedDrivers, ambiguousRecruitment: ambiguousRecruitment };
+  }
+
+
+  /* ---- Tab: Non rattachés (fiabilité du rapprochement) ---- */
+  function renderUnmatched(filtered) {
+    var panel = document.getElementById("panel-unmatched");
+    // Independant du sheet recrutement (contrairement au reste de cet
+    // onglet) — s'appuie uniquement sur les sinistres eux-memes.
+    var partC = renderOrphelinSuggestionsCard(suggestDriversForOrphelins(filtered));
+
+    var byKey = state.recruitment.byKey;
+    if (!byKey || Object.keys(byKey).length === 0) {
+      panel.innerHTML = partC + emptyState("Aucune donnée de recrutement chargée (le reste de cet onglet en dépend).");
+      wireConfirmButtons(panel);
+      return;
+    }
+    var m = computeRecruitmentMatch(filtered);
+
+    var SEARCH_MODES = [
+      { key: "name", label: "Nom" },
+      { key: "phone", label: "Téléphone" },
+      { key: "permit", label: "Permis" },
+      { key: "birthDate", label: "Date de naissance" }
+    ];
+    var searchModeToggle = '<div class="tabs" style="margin:8px 0 4px" role="group" aria-label="Chercher par">' +
+      SEARCH_MODES.map(function (m2) {
+        return '<button type="button" class="tab" data-search-mode="' + m2.key + '" aria-selected="' + (state.unmatchedSearchMode === m2.key) + '">' + esc(m2.label) + "</button>";
+      }).join("") + "</div>";
+
+    var partA = '<div class="chart-card"><h3>Chauffeurs sinistrés sans correspondance recrutement (' + m.unmatchedDrivers.length + ')</h3>' +
+      '<div class="chart-note">Suggestions par plusieurs signaux combinés : nom (surnom, faute de frappe, nom marital), téléphone identique, permis identique, et proximité entre le 1er shift (sinistres) et la date d\'inscription ou d\'assignation (sheet recrutement) — chaque candidat affiche le(s) signal(aux) qui l\'ont fait remonter. Rien n\'est appliqué automatiquement — clique "Confirmer" une fois vérifié (persisté, survit aux rechargements). La recherche libre ci-dessous peut chercher par nom, téléphone, permis ou date de naissance — choisis le champ :</div>' +
+      searchModeToggle +
+      (m.unmatchedDrivers.length
+        ? '<ul class="history unmatched-list">' + m.unmatchedDrivers
+            .sort(function (a, b) { return b.nbSinistres - a.nbSinistres; })
+            .map(function (d) {
+              var candidates = multiSignalCandidates(d, byKey, 5);
+              var candidatesHtml = candidates.length
+                ? '<ul class="fuzzy-candidates">' + candidates.map(function (c) {
+                    var phones = Object.keys(c.entry.phones || {});
+                    var permits = Object.keys(c.entry.permits || {});
+                    return "<li><span>" + esc(c.entry.displayName) + " (" + esc(c.reasons.join(", ")) + ")</span>" +
+                      "<span class=\"muted\">note: " + fmtScore(c.entry.score) + " · assignation: " + fmtDate(c.entry.assignedDate) +
+                      (phones.length ? " · tél (recrutement): " + phones.map(esc).join(", ") : "") +
+                      (permits.length ? " · permis (recrutement): " + permits.map(esc).join(", ") : "") +
+                      (c.entry.birthDate ? " · né(e): " + fmtDate(c.entry.birthDate) : "") +
+                      (c.entry.residence ? " · habite: " + esc(c.entry.residence) : "") +
+                      (ALIAS_MAP[d.driverKey] === c.key
+                        ? " · <strong>✓ confirmé</strong>"
+                        : " · <button type=\"button\" data-confirm-recruitment data-driver-key=\"" + esc(d.driverKey) + "\" data-driver-name=\"" + esc(d.name) + "\" data-recruitment-key=\"" + esc(c.key) + "\" data-recruitment-name=\"" + esc(c.entry.displayName) + "\">Confirmer</button>") +
+                      "</span></li>";
+                  }).join("") + "</ul>"
+                : '<div class="chart-note" style="margin:4px 0 0">Aucun candidat proche (nom, téléphone, permis, date).</div>';
+              var searchBoxHtml = "<input type=\"text\" class=\"driver-search\" placeholder=\"Chercher un chauffeur (recrutement)…\"" +
+                " data-driver-search data-driver-key=\"" + esc(d.driverKey) + "\" data-driver-name=\"" + esc(d.name) + "\">" +
+                "<div class=\"driver-search-results\" data-driver-search-results data-driver-key=\"" + esc(d.driverKey) + "\"></div>";
+              // William, 2026-09-03 : tél/permis cote SINISTRES affiches UNE
+              // FOIS ici, au niveau du chauffeur (pas repetes sur chaque
+              // candidat comme avant — meme valeur partout, redondant et
+              // ca cachait l'info utile). C'est la reference a comparer
+              // contre "tél/permis (recrutement)" de chaque candidat.
+              var sinistresContact = (d.phone ? " · tél (sinistres): " + esc(d.phone) : "") +
+                (d.licenceNumber ? " · permis (sinistres): " + esc(d.licenceNumber) : "") +
+                (d.firstShiftDate ? " · 1er shift (sinistres): " + fmtDate(d.firstShiftDate) : "");
+              return "<li><span>" + esc(d.name) + "</span><span class=\"muted\">" + d.nbSinistres + " sinistre(s)" + sinistresContact + "</span>" + candidatesHtml + searchBoxHtml + "</li>";
+            })
+            .join("") + "</ul>"
+        : '<div class="chart-note">Aucun — tous les chauffeurs sinistrés ont une correspondance.</div>') +
+      "</div>";
+
+    var partB = '<div class="chart-card"><h3>Correspondances ambiguës — plusieurs candidats, même nom (' + m.ambiguousRecruitment.length + ')</h3>' +
+      '<div class="chart-note">Ces noms apparaissent avec plusieurs numéros de téléphone distincts dans le sheet recrutement — impossible de savoir lequel correspond au chauffeur sinistré sans info supplémentaire. Exclus du graphique de corrélation.</div>' +
+      (m.ambiguousRecruitment.length
+        ? '<ul class="history">' + m.ambiguousRecruitment
+            .map(function (d) { return "<li><span>" + esc(d.key) + "</span><span class=\"muted\">" + d.distinctPeople + " candidats, dernier score " + fmtScore(d.score) + "</span></li>"; })
+            .join("") + "</ul>"
+        : '<div class="chart-note">Aucune ambiguïté détectée.</div>') +
+      "</div>";
+
+    panel.innerHTML = partC + partA + partB;
+    wireConfirmButtons(panel);
+  }
+
+  /* ---- Tab: Déclarations (rapprochement avec le suivi assureur) ----
+     William, 2026-09-03 : sheet "suivi declaration de sinistre" (tenu a
+     jour en continu, hors pipeline) rapproche recurrent avec
+     Immobilisations_v05/2026 — meme esprit que "Non rattachés" (suggestions
+     seulement, rien n'est jamais applique/ecrit dans le sheet source),
+     demande explicitement suite a l'analyse du 2026-09-03 (gap de juin
+     identifie : 51 plaques dans le CSV assureur absentes du suivi). */
+
+  // Convertit une date "JJ/MM/AAAA" (format du sheet declarations, colonne
+  // francaise) en ISO "AAAA-MM-JJ" pour rester comparable a dateReference
+  // (toujours ISO partout ailleurs dans le pipeline). Retourne null si la
+  // valeur est vide ou ne matche pas le format attendu.
+  function parseDMY(raw) {
+    if (!raw) return null;
+    var s = String(raw).trim();
+    var m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (!m) return null;
+    var dd = m[1].length === 1 ? "0" + m[1] : m[1];
+    var mm = m[2].length === 1 ? "0" + m[2] : m[2];
+    return m[3] + "-" + mm + "-" + dd;
+  }
+
+  // Normalise une ligne brute du sheet "suivi declaration de sinistre" (en
+  // libelles francais tels quels — pas de renommage cote Apps Script, ce
+  // sheet n'est pas ecrit par le pipeline). Les numeros pre-alloues sans
+  // aucune donnee (ex: SINE-2026-207+, confirme le 2026-09-03) sont
+  // silencieusement ignores plutot que de polluer le rapprochement.
+  function normalizeDeclaration(row) {
+    var num = pick(row, ["N° Déclaration"]);
+    if (!num) return null;
+    var plaque = pick(row, ["Immatriculation du Véhicule"]);
+    var plaqueProvisoire = pick(row, ["IMMATRICULATION PROVISOIRE"]);
+    if (!plaque && !plaqueProvisoire) return null; // ligne sans vehicule -> rien a rapprocher
+    var dateSinistre = parseDMY(pick(row, ["Date de Sinistre"]));
+    var dateDeclaration = parseDMY(pick(row, ["Date de declaration"]));
+    return {
+      numDeclaration: String(num).trim(),
+      plaque: plaque ? String(plaque).trim().toUpperCase() : null,
+      plaqueProvisoire: plaqueProvisoire ? String(plaqueProvisoire).trim().toUpperCase() : null,
+      dateSinistre: dateSinistre,
+      dateDeclaration: dateDeclaration,
+      // Meme regle de priorite que cote sinistres (Rule R1) : date de
+      // sinistre quand dispo, sinon date de declaration.
+      dateRef: dateSinistre || dateDeclaration,
+      statut: pick(row, ["Statut Déclaration"]),
+      assureur: pick(row, ["ASSUREUR"]),
+      reparateur: pick(row, ["Réparateur Attribué"]),
+      typeDeclaration: pick(row, ["type de déclaration"]),
+      commentaire: pick(row, ["COMMENTAIRE"])
+    };
+  }
+
+  var DECLARATION_MATCH_WINDOW_DAYS = 7;
+
+  // Rapproche chaque declaration assureur avec le sinistre du suivi le plus
+  // proche dans le temps (<= 7j), sur la MEME plaque (immatriculation
+  // definitive OU provisoire — les deux sont testees, car le suivi comme le
+  // sheet assureur melangent parfois plaque finale et code provisoire
+  // WWCIxx, voir memoire du 2026-09-03). Jamais applique : sert uniquement
+  // a lister les ecarts pour verification/saisie manuelle par William.
+  function computeDeclarationReconciliation(filtered) {
+    var declarations = state.declarations.rows || [];
+    var byPlaque = {};
+    filtered.forEach(function (r) {
+      if (!r.plaque) return;
+      var key = String(r.plaque).trim().toUpperCase();
+      if (!byPlaque[key]) byPlaque[key] = [];
+      byPlaque[key].push(r);
+    });
+
+    // Index par sinistreId — necessaire pour reattacher un rapprochement
+    // MANUEL (persiste par sinistreId, pas par plaque/date). William,
+    // 2026-09-05.
+    var byId = {};
+    filtered.forEach(function (r) { if (r.sinistreId) byId[r.sinistreId] = r; });
+
+    var matched = [];
+    var unmatchedDeclarations = [];
+    var matchedSinistreIds = {};
+
+    declarations.forEach(function (d) {
+      // Le rapprochement MANUEL est prioritaire sur l'automatique : c'est une
+      // decision explicite de William et elle sert justement aux cas que la
+      // fenetre a +-7j sur la meme plaque ne peut pas trouver (declaration
+      // tardive, plaque provisoire d'un cote et definitive de l'autre). Si le
+      // sinistre lie sort de la selection filtree (periode/type de location),
+      // la declaration retombe en "non rapprochee" plutot que de compter un
+      // match invisible a l'ecran.
+      var manual = confirmedDeclarationMatches[d.numDeclaration];
+      if (manual && byId[manual.sinistreId]) {
+        var rm = byId[manual.sinistreId];
+        var mGap = daysBetweenIso(d.dateRef, rm.dateReference);
+        matched.push({ declaration: d, sinistre: rm, gapDays: mGap === null ? null : Math.abs(mGap), manual: true });
+        matchedSinistreIds[rm.sinistreId] = true;
+        return;
+      }
+      var candidates = (d.plaque ? (byPlaque[d.plaque] || []) : [])
+        .concat(d.plaqueProvisoire && d.plaqueProvisoire !== d.plaque ? (byPlaque[d.plaqueProvisoire] || []) : []);
+      var best = null, bestGap = null;
+      candidates.forEach(function (r) {
+        var gap = daysBetweenIso(d.dateRef, r.dateReference);
+        if (gap === null) return;
+        var absGap = Math.abs(gap);
+        if (absGap > DECLARATION_MATCH_WINDOW_DAYS) return;
+        if (bestGap === null || absGap < bestGap) { bestGap = absGap; best = r; }
+      });
+      if (best) {
+        matched.push({ declaration: d, sinistre: best, gapDays: bestGap });
+        matchedSinistreIds[best.sinistreId] = true;
+      } else {
+        unmatchedDeclarations.push(d);
+      }
+    });
+
+    var unmatchedSinistres = filtered.filter(function (r) { return !matchedSinistreIds[r.sinistreId]; });
+
+    // Repartition mensuelle — un total qui coincide peut cacher des
+    // sinistres totalement differents cote a cote (confirme en donnees
+    // reelles le 2026-09-03 sur juillet : 47/47 en volume mais 27+26
+    // plaques exclusives a chaque source) — d'ou la colonne "rapprochees".
+    var monthly = {};
+    function bump(mk, field) {
+      if (!mk) return;
+      if (!monthly[mk]) monthly[mk] = { month: mk, declarations: 0, sinistres: 0, matched: 0, sinistresMatched: 0 };
+      monthly[mk][field]++;
+    }
+    declarations.forEach(function (d) { bump(monthKey(d.dateRef), "declarations"); });
+    // sinistresMatched est compte cote SINISTRE (et pas deduit de "matched")
+    // parce que plusieurs declarations peuvent pointer le meme sinistre :
+    // sinistres - matched pourrait alors passer sous zero et fausser le
+    // graphique "rapprochés vs non rapprochés". William, 2026-09-05.
+    filtered.forEach(function (r) {
+      bump(monthKey(r.dateReference), "sinistres");
+      if (matchedSinistreIds[r.sinistreId]) bump(monthKey(r.dateReference), "sinistresMatched");
+    });
+    matched.forEach(function (mt) { bump(monthKey(mt.declaration.dateRef), "matched"); });
+    var monthlyRows = Object.keys(monthly).sort().map(function (mk) { return monthly[mk]; });
+
+    return {
+      matched: matched,
+      manualMatched: matched.filter(function (mt) { return mt.manual; }),
+      unmatchedDeclarations: unmatchedDeclarations,
+      unmatchedSinistres: unmatchedSinistres,
+      monthlyRows: monthlyRows
+    };
+  }
+
+  // William, 2026-09-05 : "est-ce que tu peux me permettre de rapprocher
+  // aussi les sinistres déclarés des sinistres que je comptabilise ?" —
+  // meme principe que "Non rattachés" cote chauffeurs : on SUGGERE des
+  // sinistres candidats pour chaque declaration restee orpheline, William
+  // valide, et le lien est persiste (jamais applique au sheet source).
+  //
+  // Fenetre volontairement plus large que DECLARATION_MATCH_WINDOW_DAYS (7j,
+  // utilisee par le rapprochement automatique) : si l'automatique a echoue
+  // c'est justement que l'ecart depasse 7 jours ou que la plaque differe.
+  var DECLARATION_SUGGEST_WINDOW_DAYS = 10;
+
+  function declarationCandidates(d, filtered, limit) {
+    var plaques = {};
+    if (d.plaque) plaques[d.plaque] = true;
+    if (d.plaqueProvisoire) plaques[d.plaqueProvisoire] = true;
+    var out = [];
+    filtered.forEach(function (r) {
+      var key = String(r.plaque || "").trim().toUpperCase();
+      var gap = daysBetweenIso(d.dateRef, r.dateReference);
+      var absGap = gap === null ? null : Math.abs(gap);
+      if (plaques[key]) {
+        // Meme plaque, quel que soit l'ecart de date : le cas le plus
+        // frequent est une declaration saisie des semaines apres le sinistre.
+        out.push({
+          sinistre: r, gapDays: absGap, score: 2,
+          reason: "même plaque" + (absGap === null ? "" : " · écart " + absGap + "j")
+        });
+      } else if (absGap !== null && absGap <= DECLARATION_SUGGEST_WINDOW_DAYS) {
+        // Plaque differente mais date tres proche : typiquement plaque
+        // provisoire d'un cote, definitive de l'autre.
+        out.push({
+          sinistre: r, gapDays: absGap, score: 1,
+          reason: "date proche (" + absGap + "j) · plaque différente"
+        });
+      }
+    });
+    return out
+      .sort(function (a, b) {
+        if (b.score !== a.score) return b.score - a.score;
+        return (a.gapDays === null ? 1e9 : a.gapDays) - (b.gapDays === null ? 1e9 : b.gapDays);
+      })
+      .slice(0, limit || 5);
+  }
+
+  // Recherche libre parmi les sinistres de la selection filtree — par plaque
+  // ou par nom de chauffeur, pour les rapprochements que ni la plaque ni la
+  // date ne permettent de suggerer.
+  function searchSinistres(query, filtered) {
+    var raw = String(query || "").trim();
+    if (!raw) return [];
+    var qPlaque = raw.toUpperCase().replace(/[^A-Z0-9]/g, "");
+    var qName = normalizeDriverName(raw);
+    return filtered
+      .filter(function (r) {
+        var p = String(r.plaque || "").toUpperCase().replace(/[^A-Z0-9]/g, "");
+        if (qPlaque && p.indexOf(qPlaque) !== -1) return true;
+        return !!qName && normalizeDriverName(r.name || "").indexOf(qName) !== -1;
+      })
+      .sort(function (a, b) { return (b.dateReference || "").localeCompare(a.dateReference || ""); })
+      .slice(0, 8);
+  }
+
+  function sinistreLabel(r) {
+    return esc(r.plaque) + " — " + fmtDate(r.dateReference) + " · " + esc(r.name || "chauffeur inconnu") +
+      (r.typeLocation ? " · " + esc(typeLocLabel(r.typeLocation)) : "");
+  }
+
+  // Bouton "Lier" d'un sinistre candidat vers une declaration. Les valeurs
+  // passent par des data-* (jamais un onclick inline) — un nom de chauffeur
+  // contient regulierement une apostrophe.
+  function linkSinistreButton(d, r, label) {
+    return "<button type=\"button\" data-link-declaration" +
+      " data-declaration-num=\"" + esc(d.numDeclaration) + "\"" +
+      " data-sinistre-id=\"" + esc(r.sinistreId) + "\"" +
+      " data-plaque=\"" + esc(r.plaque) + "\"" +
+      " data-date-reference=\"" + esc(r.dateReference) + "\"" +
+      " data-sinistre-name=\"" + esc(r.name || "") + "\">" + esc(label) + "</button>";
+  }
+
+  function renderDeclarations(filtered) {
+    var panel = document.getElementById("panel-declarations");
+    if (!state.declarations.rows || state.declarations.rows.length === 0) {
+      panel.innerHTML = emptyState("Aucune déclaration chargée (connecteur Google Drive indisponible, ou feuille vide).");
+      wireConfirmButtons(panel);
+      return;
+    }
+
+    var rec = computeDeclarationReconciliation(filtered);
+    var totalDecl = state.declarations.rows.length;
+    var totalMatched = rec.matched.length;
+    var totalUnmatched = rec.unmatchedDeclarations.length;
+    var totalManual = rec.manualMatched.length;
+    var rate = totalDecl ? Math.round((totalMatched / totalDecl) * 100) : 0;
+
+    var summary = '<div class="chart-card"><h3>Rapprochement déclarations assureur ↔ suivi sinistres</h3>' +
+      '<div class="chart-note">Rapproche <span class="tabular">suivi declaration de sinistre</span> (assureur) et <span class="tabular">Immobilisations_v05/2026</span> par plaque (immatriculation définitive ou provisoire) et date à ±' + DECLARATION_MATCH_WINDOW_DAYS + ' jours. Rien n\'est modifié automatiquement — sert à repérer les sinistres déclarés à l\'assureur mais absents du suivi (et inversement).</div>' +
+      '<div class="kpi-row" style="grid-template-columns:repeat(4,1fr);margin:12px 0 0">' +
+        kpiCard("Déclarations", totalDecl, "", "sur la période filtrée") +
+        kpiCard("Rapprochées", totalMatched, "", "auto (plaque + date ≤ " + DECLARATION_MATCH_WINDOW_DAYS + "j) dont " + totalManual + " manuel(s)") +
+        kpiCard("Sans sinistre correspondant", totalUnmatched, "", "à vérifier / saisir dans le suivi", totalUnmatched > 0) +
+        kpiCard("Taux de rapprochement", rate, "%", "déclarations retrouvées dans le suivi") +
+      "</div></div>";
+
+    var monthlyTable = '<div class="chart-card"><h3>Déclarations vs suivi, par mois</h3>' +
+      '<div class="chart-note">Un volume identique ne garantit pas les mêmes sinistres — voir la colonne "Rapprochées".</div>' +
+      '<div class="table-wrap"><table><thead><tr><th>Mois</th><th>Déclarations</th><th>Suivi</th><th>Rapprochées</th><th>Écart</th></tr></thead><tbody>' +
+      rec.monthlyRows.map(function (m) {
+        var gap = m.declarations - m.sinistres;
+        return "<tr><td>" + esc(m.month) + "</td><td class=\"tabular\">" + m.declarations + "</td><td class=\"tabular\">" + m.sinistres +
+          "</td><td class=\"tabular\">" + m.matched + "</td><td class=\"tabular\">" + (gap > 0 ? "+" + gap : gap) + "</td></tr>";
+      }).join("") + "</tbody></table></div></div>";
+
+    // William, 2026-09-05 : les deux graphiques demandes. Memes primitives
+    // que l'onglet "DTO vs Location" (donc meme interaction : cliquer un mois
+    // restreint la periode a ce mois).
+    var volumeChart = lineChartGeneric(rec.monthlyRows.map(function (m) {
+      return { month: m.month, values: { sinistres: m.sinistres, declarations: m.declarations } };
+    }), [
+      { key: "sinistres", label: "Mes sinistres (suivi)", color: "var(--accent)" },
+      { key: "declarations", label: "Déclarations (assureur)", color: "var(--warn)" }
+    ], {
+      title: "Mes sinistres vs déclarations assureur",
+      note: "Volumes bruts par mois : à gauche ce que je comptabilise dans Immobilisations_v05/2026, à droite le suivi assureur. Deux courbes qui se suivent sans se toucher = un écart de saisie récurrent d'un côté ou de l'autre (un volume identique ne garantit pas les mêmes sinistres, voir le tableau ci-dessus)."
+    });
+
+    // Trois series plutot que deux : "non rapproché" existe des DEUX cotes,
+    // et les confondre cacherait de quel cote il manque une saisie.
+    var rapprocheChart = stackedBarChartGeneric(rec.monthlyRows.map(function (m) {
+      return { month: m.month, values: {
+        matched: m.matched,
+        declSeules: Math.max(0, m.declarations - m.matched),
+        sinSeuls: Math.max(0, m.sinistres - m.sinistresMatched)
+      } };
+    }), [
+      { key: "matched", label: "Rapprochés", color: "var(--good)" },
+      { key: "declSeules", label: "Déclarations sans sinistre", color: "var(--warn)" },
+      { key: "sinSeuls", label: "Sinistres sans déclaration", color: "var(--risk)" }
+    ], {
+      title: "Rapprochés vs non rapprochés",
+      note: "Par mois : les déclarations rapprochées à un sinistre du suivi (automatiquement ou à la main), les déclarations restées sans sinistre correspondant, et les sinistres du suivi sans déclaration assureur. Les rapprochements manuels que tu confirmes ci-dessous font basculer une barre orange en vert."
+    });
+
+    var manualCard = '<div class="chart-card"><h3>Déclarations rapprochées à la main (' + totalManual + ')</h3>' +
+      '<div class="chart-note">Liens que tu as confirmés toi-même, prioritaires sur le rapprochement automatique. Persistés (ils survivent aux rechargements et sont visibles par les autres lecteurs) et jamais écrits dans le sheet source. "Délier" les retire.</div>' +
+      (totalManual
+        ? '<ul class="history">' + rec.manualMatched
+            .sort(function (a, b) { return (b.declaration.dateRef || "").localeCompare(a.declaration.dateRef || ""); })
+            .map(function (mt) {
+              return "<li><span>" + esc(mt.declaration.numDeclaration) + " — " + fmtDate(mt.declaration.dateRef) + "</span>" +
+                "<span class=\"muted\">↔ " + sinistreLabel(mt.sinistre) +
+                (mt.gapDays === null ? "" : " · écart " + mt.gapDays + "j") +
+                " · <button type=\"button\" data-unlink-declaration data-declaration-num=\"" + esc(mt.declaration.numDeclaration) + "\">Délier</button>" +
+                "</span></li>";
+            }).join("") + "</ul>"
+        : '<div class="chart-note">Aucun pour l\'instant — utilise "Lier" dans la liste ci-dessous.</div>') +
+      "</div>";
+
+    var unmatchedList = rec.unmatchedDeclarations.length
+      ? '<ul class="history unmatched-list">' + rec.unmatchedDeclarations
+          .sort(function (a, b) { return (b.dateRef || "").localeCompare(a.dateRef || ""); })
+          .map(function (d) {
+            var already = reviewedDeclarations[d.numDeclaration];
+            var plaques = d.plaqueProvisoire && d.plaqueProvisoire !== d.plaque
+              ? esc(d.plaque || "—") + " / " + esc(d.plaqueProvisoire)
+              : esc(d.plaque || d.plaqueProvisoire || "—");
+            // Sinistres candidats + recherche libre — William, 2026-09-05.
+            var cands = declarationCandidates(d, filtered, 5);
+            var candidatesHtml = cands.length
+              ? '<ul class="fuzzy-candidates">' + cands.map(function (c) {
+                  return "<li><span>" + sinistreLabel(c.sinistre) + "</span>" +
+                    "<span class=\"muted\">" + esc(c.reason) + " · " + linkSinistreButton(d, c.sinistre, "Lier") + "</span></li>";
+                }).join("") + "</ul>"
+              : '<div class="chart-note" style="margin:4px 0 0">Aucun sinistre candidat (ni même plaque, ni date à ±' + DECLARATION_SUGGEST_WINDOW_DAYS + 'j) — cherche par plaque ou par nom ci-dessous.</div>';
+            var searchBoxHtml = "<input type=\"text\" class=\"driver-search\" placeholder=\"Chercher un sinistre du suivi (plaque ou nom du chauffeur)…\"" +
+              " data-declaration-search data-declaration-num=\"" + esc(d.numDeclaration) + "\">" +
+              "<div class=\"driver-search-results\"></div>";
+            return "<li><span>" + esc(d.numDeclaration) + " — " + plaques + "</span>" +
+              "<span class=\"muted\">" + fmtDate(d.dateRef) +
+              (d.assureur ? " · " + esc(d.assureur) : "") +
+              (d.reparateur ? " · " + esc(d.reparateur) : "") +
+              (d.statut ? " · statut: " + esc(d.statut) : "") +
+              (d.commentaire ? " · " + esc(d.commentaire) : "") +
+              (already
+                ? " · <strong>✓ traité</strong>"
+                : " · <button type=\"button\" data-confirm-declaration data-declaration-num=\"" + esc(d.numDeclaration) + "\">Marquer traité</button>") +
+              "</span>" + candidatesHtml + searchBoxHtml + "</li>";
+          }).join("") + "</ul>"
+      : '<div class="chart-note">Aucune déclaration sans sinistre correspondant sur la sélection actuelle.</div>';
+
+    var unmatchedCard = '<div class="chart-card"><h3>Déclarations sans sinistre correspondant (' + rec.unmatchedDeclarations.length + ')</h3>' +
+      '<div class="chart-note">Sinistre déclaré à l\'assureur mais introuvable dans le suivi à ±' + DECLARATION_MATCH_WINDOW_DAYS + ' jours sur la même plaque. Chaque ligne propose les sinistres candidats du suivi (même plaque quel que soit l\'écart de date, ou date à ±' + DECLARATION_SUGGEST_WINDOW_DAYS + 'j sur une autre plaque) — "Lier" enregistre le rapprochement, qui compte alors comme rapproché dans les compteurs et les graphiques ci-dessus. La recherche libre couvre tous les sinistres de la sélection, par plaque ou par nom de chauffeur. "Marquer traité" note seulement que tu as vérifié. Rien n\'est jamais écrit dans le sheet source.</div>' +
+      unmatchedList + "</div>";
+
+    var unmatchedSinistresBlock = '<div class="chart-card"><h3>Sinistres du suivi sans déclaration assureur (' + rec.unmatchedSinistres.length + ')</h3>' +
+      '<div class="chart-note">Informatif — un sinistre peut légitimement n\'avoir aucune déclaration assureur (auto cash, dossier interne). Utile pour repérer les cas qui auraient dû être déclarés.</div>' +
+      (rec.unmatchedSinistres.length
+        ? '<ul class="history">' + rec.unmatchedSinistres
+            .sort(function (a, b) { return (b.dateReference || "").localeCompare(a.dateReference || ""); })
+            .slice(0, 50)
+            .map(function (r) {
+              return "<li><span>" + esc(r.plaque) + " — " + esc(r.name || "—") + "</span><span class=\"muted\">" + fmtDate(r.dateReference) + "</span></li>";
+            }).join("") + "</ul>" +
+            (rec.unmatchedSinistres.length > 50 ? '<div class="chart-note">… et ' + (rec.unmatchedSinistres.length - 50) + ' de plus.</div>' : "")
+        : '<div class="chart-note">Tous les sinistres de la sélection ont une déclaration correspondante.</div>') +
+      "</div>";
+
+    panel.innerHTML = summary + volumeChart + rapprocheChart + monthlyTable +
+      manualCard + unmatchedCard + unmatchedSinistresBlock;
+    wireConfirmButtons(panel);
+  }
+
+  /* ---- Tab: Rapprochements (trace des matchings confirmés) ----
+     William, 2026-09-03 : trace de tous les rapprochements chauffeur
+     confirmés dans "Non rattachés" — infos des deux côtés (nom, tél,
+     permis, date de naissance) pour verification croisée / audit. Lecture
+     seule (pas de "defaire" ici — le retrait se fait toujours depuis
+     "Non rattachés" si besoin un jour). Volontairement PAS filtre par
+     state.filters : c'est une trace/journal, un filtre actif ne doit
+     jamais faire disparaitre une confirmation deja faite. */
+
+  // Reconstruit, pour chaque rapprochement confirme, les infos des deux
+  // cotes a partir des donnees LIVE actuelles (pas seulement ce qui etait
+  // connu au moment de la confirmation) — si le sheet recrutement a ete
+  // complete depuis (tel/permis/naissance ajoutes), la trace le reflete.
+  function buildRapprochementsTrace() {
+    var sinistresByKey = {};
+    state.records.forEach(function (r) {
+      if (!r.driverKey) return;
+      if (!sinistresByKey[r.driverKey]) sinistresByKey[r.driverKey] = { phone: null, licenceNumber: null };
+      if (r.phone && !sinistresByKey[r.driverKey].phone) sinistresByKey[r.driverKey].phone = r.phone;
+      if (r.licenceNumber && !sinistresByKey[r.driverKey].licenceNumber) sinistresByKey[r.driverKey].licenceNumber = r.licenceNumber;
+    });
+    var recByKey = state.recruitment.byKey || {};
+
+    return Object.keys(confirmedRecruitmentMatches).map(function (sinistreKey) {
+      var m = confirmedRecruitmentMatches[sinistreKey];
+      var sInfo = sinistresByKey[sinistreKey] || {};
+      var rInfo = recByKey[m.recruitmentKey] || {};
+      return {
+        confirmedAt: m.confirmedAt || null,
+        sinistresName: m.sinistreName || sinistreKey,
+        sinistresPhone: sInfo.phone,
+        sinistresLicence: sInfo.licenceNumber,
+        recruitmentName: m.recruitmentName || rInfo.displayName || m.recruitmentKey,
+        recruitmentPhones: Object.keys(rInfo.phones || {}),
+        recruitmentPermits: Object.keys(rInfo.permits || {}),
+        recruitmentBirthDate: rInfo.birthDate || null
+      };
+    });
+  }
+
+  function exportRapprochementsCsv() {
+    var trace = buildRapprochementsTrace()
+      .sort(function (a, b) { return (b.confirmedAt || "").localeCompare(a.confirmedAt || ""); });
+    var headers = ["Confirmé le", "Sinistres - Nom", "Sinistres - Téléphone", "Sinistres - Permis",
+      "Recrutement - Nom", "Recrutement - Téléphone", "Recrutement - Permis", "Recrutement - Date de naissance"];
+    function csvEscape(v) {
+      var s = v == null ? "" : String(v);
+      return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+    }
+    var lines = [headers.map(csvEscape).join(",")];
+    trace.forEach(function (t) {
+      lines.push([
+        t.confirmedAt ? t.confirmedAt.slice(0, 10) : "",
+        t.sinistresName, t.sinistresPhone || "", t.sinistresLicence || "",
+        t.recruitmentName, t.recruitmentPhones.join("; "), t.recruitmentPermits.join("; "), t.recruitmentBirthDate || ""
+      ].map(csvEscape).join(","));
+    });
+    // BOM en tete — sans lui Excel (tres probablement l'usage ici) affiche
+    // les caracteres accentues corrompus a l'ouverture d'un CSV UTF-8.
+    var blob = new Blob(["﻿" + lines.join("\r\n")], { type: "text/csv;charset=utf-8" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = "rapprochements-chauffeurs-" + new Date().toISOString().slice(0, 10) + ".csv";
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function renderRapprochements() {
+    var panel = document.getElementById("panel-rapprochements");
+    var trace = buildRapprochementsTrace()
+      .sort(function (a, b) { return (b.confirmedAt || "").localeCompare(a.confirmedAt || ""); });
+
+    var exportBtn = '<button type="button" class="reset" data-export-rapprochements-csv' +
+      (trace.length ? "" : " disabled") + '>Exporter en CSV</button>';
+    // William, 2026-09-05 : purge manuelle — voir purgeMatchesFromUi. Actif
+    // des qu'il y a quelque chose a purger d'un cote OU de l'autre
+    // (chauffeurs ou orphelins), les deux collections etant videes ensemble.
+    // Confirmation en deux clics et compte-rendu affiches ici, dans la page :
+    // window.confirm/window.alert ne fonctionnent pas dans l'iframe du
+    // viewer d'artifact (voir purgeUi).
+    var nbOrphelinsConfirmes = Object.keys(confirmedOrphelins).length;
+    var nbAPurger = trace.length + nbOrphelinsConfirmes;
+    var purgeBtn = purgeUi.busy
+      ? '<button type="button" class="reset" disabled>Suppression…</button>'
+      : purgeUi.armed
+        ? '<button type="button" class="reset danger" data-purge-rapprochements-confirm>Confirmer la suppression de ' + nbAPurger + ' rapprochement(s)</button>' +
+          ' <button type="button" class="reset" data-purge-rapprochements-cancel>Annuler</button>'
+        : '<button type="button" class="reset" data-purge-rapprochements' +
+          (nbAPurger ? "" : " disabled") + '>Tout supprimer</button>';
+    var purgeMsg = purgeUi.message
+      ? '<div class="chart-note" style="margin-top:6px;color:var(--' + (purgeUi.isError ? "risk" : "good") + ')">' + esc(purgeUi.message) + "</div>"
+      : "";
+
+    var driverSection = '<div class="chart-card"><h3>Rapprochements chauffeurs confirmés (' + trace.length + ')</h3>' +
+      '<div class="chart-note">Trace des rapprochements manuels confirmés dans "Non rattachés", avec les infos des deux côtés pour vérification croisée. Lecture seule — n\'affecte jamais le sheet source. ' + exportBtn + ' ' + purgeBtn +
+      '<br>« Tout supprimer » vide les rapprochements chauffeurs <em>et</em> orphelins (une copie complète part dans <span class="tabular">purge_archive</span> avant toute suppression). À utiliser une fois le pipeline corrigé déployé : les rapprochements confirmés avant ce correctif ont pu l\'être sur un téléphone/permis appartenant à un autre chauffeur ayant tenu la même plaque. Les liens déclaration ↔ sinistre de l\'onglet « Déclarations » ne sont pas concernés (ils se retirent un par un avec « Délier »).' +
+      purgeMsg + '</div>' +
+      (trace.length
+        ? '<div class="table-wrap"><table><thead><tr>' +
+            "<th>Confirmé le</th><th>Sinistres — Nom</th><th>Sinistres — Téléphone</th><th>Sinistres — Permis</th>" +
+            "<th>Recrutement — Nom</th><th>Recrutement — Téléphone</th><th>Recrutement — Permis</th><th>Recrutement — Naissance</th>" +
+            "</tr></thead><tbody>" +
+            trace.map(function (t) {
+              return "<tr><td>" + (t.confirmedAt ? fmtDate(t.confirmedAt.slice(0, 10)) : "—") + "</td>" +
+                "<td>" + esc(t.sinistresName) + "</td><td class=\"tabular\">" + esc(t.sinistresPhone || "—") + "</td><td>" + esc(t.sinistresLicence || "—") + "</td>" +
+                "<td>" + esc(t.recruitmentName) + "</td><td class=\"tabular\">" + esc(t.recruitmentPhones.join(", ") || "—") + "</td><td>" + esc(t.recruitmentPermits.join(", ") || "—") + "</td>" +
+                "<td>" + esc(t.recruitmentBirthDate || "—") + "</td></tr>";
+            }).join("") + "</tbody></table></div>"
+        : '<div class="chart-note">Aucun rapprochement confirmé pour l\'instant — passe par "Non rattachés" pour en valider.<br>Note : les rapprochements confirmés avant le 05/09/2026 ont été retirés, car le téléphone et le permis affichés côté sinistres pouvaient alors appartenir à un autre chauffeur ayant tenu la même plaque (corrigé depuis). Ils sont à refaire sur les données corrigées.</div>') +
+      "</div>";
+
+    var orphelinTrace = Object.keys(confirmedOrphelins).map(function (k) { return confirmedOrphelins[k]; })
+      .sort(function (a, b) { return (b.confirmedAt || "").localeCompare(a.confirmedAt || ""); });
+    var orphelinSection = '<div class="chart-card"><h3>Sinistres orphelins confirmés (' + orphelinTrace.length + ')</h3>' +
+      '<div class="chart-note">Suggestions chauffeur-orphelin marquées comme vérifiées (voir onglet "Vue véhicule" / "Non rattachés") — informatif, ne modifie jamais le comptage.</div>' +
+      (orphelinTrace.length
+        ? '<ul class="history">' + orphelinTrace.map(function (o) {
+            return "<li><span>" + esc(o.plaque) + " — " + fmtDate(o.dateReference) + "</span><span class=\"muted\">chauffeur : " + esc(o.suggestedName || "—") + "</span></li>";
+          }).join("") + "</ul>"
+        : '<div class="chart-note">Aucun.</div>') +
+      "</div>";
+
+    panel.innerHTML = driverSection + orphelinSection;
+    wireConfirmButtons(panel);
+  }
+
+  /* ---- Shared row helpers ---- */
+  function tableWrap(id, cols, rowsHtml) {
+    var head = cols.map(function (c) {
+      var active = state.sort[id] && state.sort[id].key === c[0];
+      var arrow = active ? (state.sort[id].dir === 1 ? "↑" : "↓") : "";
+      return '<th data-key="' + c[0] + '">' + esc(c[1]) + (arrow ? ' <span class="arrow">' + arrow + "</span>" : "") + "</th>";
+    }).join("");
+    return '<div class="table-wrap"><table><thead><tr>' + head + "</tr></thead><tbody>" + rowsHtml + "</tbody></table></div>";
+  }
+  function bindSort(id, cb) {
+    document.querySelectorAll("#panel-" + id + " thead th").forEach(function (th) {
+      th.addEventListener("click", function () {
+        var key = th.getAttribute("data-key");
+        var s = state.sort[id];
+        if (s.key === key) s.dir = -s.dir; else { s.key = key; s.dir = -1; }
+        cb();
+      });
+    });
+  }
+  function sortRows(rows, sort) {
+    rows.sort(function (a, b) {
+      var av = a[sort.key], bv = b[sort.key];
+      if (av === bv) return 0;
+      return (av < bv ? -1 : 1) * sort.dir;
+    });
+  }
+  function emptyState(msg) {
+    return '<div class="table-wrap"><div class="empty-state"><div class="glyph">◌</div><p>' + esc(msg) + "</p></div></div>";
+  }
+  function trendPill(delta) {
+    if (delta > 0) return '<span class="trend up">▲ +' + delta + "</span>";
+    if (delta < 0) return '<span class="trend down">▼ ' + delta + "</span>";
+    return '<span class="trend flat">— stable</span>';
+  }
+  function churnPill(v) {
+    if (v === true) return '<span class="pill churn-yes">Parti</span>';
+    if (v === false) return '<span class="pill churn-no">Actif</span>';
+    return '<span class="muted">—</span>';
+  }
+  function typeLocPill(v) {
+    if (v === "DTO") return '<span class="pill dto">DTO</span>';
+    if (v === "LOC") return '<span class="pill loc">LOC</span>';
+    return '<span class="muted">' + esc(v || "—") + "</span>";
+  }
+  function typeLocLabel(v) { return v === "DTO" ? "DTO" : v === "LOC" ? "LOC" : (v || "—"); }
+  function uniq(arr) { return Array.from(new Set(arr)); }
+  function maxMonth(records) { return records.reduce(function (m, r) { return !m || r.monthKey > m ? r.monthKey : m; }, null); }
+  function shiftMonth(mk, delta) {
+    if (!mk) return null;
+    var parts = mk.split("-").map(Number);
+    var d = new Date(parts[0], parts[1] - 1 + delta, 1);
+    return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0");
+  }
+
+  /* =========================================================
+     6. Live data — Google Drive connector (mcp capability).
+        The pipeline writes SINISTRES_MASTER as one TAB inside the
+        existing "DTO Analysis Sinistres" spreadsheet (a fixed, known
+        file — not a file of its own to search for by title, see I3).
+        get_file_metadata's contentSnippet renders each tab as a
+        "# <tab name>" heading followed by a fenced ```...``` CSV
+        block; for a small/medium tab this is the full CSV, for a
+        very large one it may be truncated (flagged as "partial").
+     ========================================================= */
+  var SINISTRES_SPREADSHEET_ID = '1VMGhNhGnATAbFIsbFT2mkAEyO55ZEOcATwpf-h1xnHA';
+  // La sortie du pipeline va dans l'onglet existant Immobilisations_v05/2026
+  // (pas un onglet SINISTRES_MASTER séparé — décision prise le 2026-08-20
+  // pour que les scripts H1/H2/H5 continuent de fonctionner sans modif).
+  var SINISTRES_MASTER_TAB_NAME = 'Immobilisations_v05/2026';
+  var RECRUTEMENT_SPREADSHEET_ID = '1yw4IF6grScjseBdUbHbEdPspLkfrkRyCUIypZWcNFxM';
+  var RECRUTEMENT_TAB_NAME = 'Enregistrement chauffeurs';
+  // "suivi declaration de sinistre" — classeur tenu a jour en continu par
+  // William cote assureur, hors pipeline. Onglet cible confirme en 1ere
+  // position (gid=0) le 2026-09-03 — meme contrainte export CSV que les
+  // deux classeurs ci-dessus (voir fetchLive).
+  var DECLARATIONS_SPREADSHEET_ID = '1bUscyVCQF7hKIPNUZ5YWMsfEWzJXakWhQSd-uMcUBtI';
+
+  // Locates the heading + fenced code block for one specific tab inside a
+  // multi-tab contentSnippet, instead of blindly taking the first ``` block
+  // in the document (which would silently read whichever tab happens to
+  // come first — I3).
+  // NB: l'ancienne extraction par titre markdown (extractTabBlock) a ete
+  // retiree — download_file_content (CSV) exporte directement l'onglet
+  // voulu tel quel, plus besoin de chercher un titre d'onglet dans un
+  // apercu texte tronque (voir fetchLive/fetchRecruitmentLive, 2026-08-20).
+
+  function parseCsvBlock(text, headerRowIndex) {
+    // Pull the fenced code block out of one tab's heading section —
+    // get_file_metadata/read_file_content wrap tab content in "```...```".
+    // For a large sheet the snippet is truncated mid-document (confirmed
+    // 2026-08-20: 500+ rows never reach a closing fence at all) — a regex
+    // requiring BOTH an opening and closing ``` never matches in that case
+    // and silently falls back to the raw text (heading line included),
+    // corrupting the header row. Handle the unclosed-fence case explicitly:
+    // take everything after the opening fence through the end of the text.
+    var openIdx = text.indexOf("```");
+    var body;
+    if (openIdx === -1) {
+      body = text;
+    } else {
+      var afterOpen = text.slice(openIdx + 3);
+      var closeIdx = afterOpen.indexOf("```");
+      body = closeIdx === -1 ? afterOpen : afterOpen.slice(0, closeIdx);
+    }
+    var lines = body.split(/\r?\n/).filter(function (l) { return l.trim().length > 0; });
+    // headerRowIndex : ligne des vrais en-tetes, ligne 0 par defaut. Le
+    // sheet "suivi declaration de sinistre" a un en-tete groupe sur la
+    // ligne 0 (uniquement les 3 colonnes de paiement — Cout/Montant/Numero
+    // de cheque, vestige d'une fusion de cellules cote Sheets) et les
+    // vrais en-tetes sur la ligne 1 — meme symptome que les onglets Looker
+    // "banner" (readSheetSkippingBanner_ cote Apps Script), meme parade :
+    // sauter une ligne de plus. William, 2026-09-03.
+    var hIdx = headerRowIndex || 0;
+    if (lines.length < hIdx + 2) return [];
+    // William, 2026-09-02 : trim() sur chaque en-tete — confirme sur le
+    // sheet recrutement que certaines colonnes ont un espace en trop en fin
+    // de libelle (ex: "Numéro de permis "), ce qui fait echouer
+    // silencieusement le match exact de pick() alors que d'autres colonnes
+    // (memes lignes) fonctionnent. Coupe le probleme a la source plutot que
+    // de corriger chaque appel a pick() un par un.
+    var headers = splitCsvLine(lines[hIdx]).map(function (h) { return h.trim(); });
+    // La derniere ligne peut etre coupee en plein milieu par la troncature
+    // du snippet — un champ manquant fera echouer normalizeRecord pour
+    // cette seule ligne (plaque/dateReference absents), sans casser le reste.
+    return lines.slice(hIdx + 1).map(function (line) {
+      var cells = splitCsvLine(line);
+      var row = {};
+      headers.forEach(function (h, i) { row[h] = cells[i]; });
+      return row;
+    });
+  }
+  function splitCsvLine(line) {
+    // Minimal CSV split — good enough for the connector's plain preview text.
+    var out = [], cur = "", inQ = false;
+    for (var i = 0; i < line.length; i++) {
+      var c = line[i];
+      if (c === '"') { inQ = !inQ; continue; }
+      if (c === "," && !inQ) { out.push(cur); cur = ""; continue; }
+      cur += c;
+    }
+    out.push(cur);
+    return out;
+  }
+
+  function loadDemo() {
+    state.records = DEMO_RECORDS.map(normalizeRecord).filter(Boolean);
+    state.dataMode = "demo";
+    state.lastUpdated = null;
+  }
+
+  // get_file_metadata's contentSnippet is a size-limited AI preview — for a
+  // 500+ row sheet it truncates well before the end (confirmed 2026-08-20,
+  // this was the actual cause of "no live data" for several rounds).
+  // download_file_content with exportMimeType 'text/csv' returns a REAL,
+  // complete CSV export instead — no truncation, no markdown-heading
+  // parsing needed. Caveat: Drive's CSV export always exports the file's
+  // FIRST/leftmost tab, never a tab picked by name — this works for
+  // Immobilisations_v05/2026 (already the first tab) but requires
+  // "Enregistrement chauffeurs" to be moved to the first position in its
+  // own spreadsheet for the recruitment fetch below to work.
+  function base64ToUtf8(b64) {
+    var binary = atob(b64);
+    var bytes = new Uint8Array(binary.length);
+    for (var i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new TextDecoder("utf-8").decode(bytes);
+  }
+
+  function fetchLive() {
+    setRefreshing(true);
+    state.debugStage = "start";
+    (async function () {
+      try {
+        state.debugStage = "claude.use(mcp)";
+        var mcp = await window.claude.use("mcp");
+        if (!mcp) { state.debugStage = "mcp indisponible (claude.use a renvoyé null)"; loadDemo(); return; }
+        state.debugStage = "mcp.callTool(download_file_content)";
+        var result = await mcp.callTool("Google Drive", "download_file_content", {
+          fileId: SINISTRES_SPREADSHEET_ID,
+          exportMimeType: "text/csv"
+        }, { cache: { refresh: true } });
+        var file = result && result.payload;
+        if (!file || !file.content) {
+          state.debugStage = "download_file_content sans contenu — " + JSON.stringify(result).slice(0, 300);
+          loadDemo(); state.dataMode = "demo"; return;
+        }
+        var csvText = base64ToUtf8(file.content);
+        var rows = parseCsvBlock(csvText);
+        var normalized = rows.map(normalizeRecord).filter(Boolean);
+        if (normalized.length === 0) {
+          state.debugStage = rows.length + " ligne(s) CSV, mais 0 après normalizeRecord (plaque/dateReference manquants ?) — 1ère ligne: " + JSON.stringify(rows[0] || {}).slice(0, 300);
+          loadDemo(); return;
+        }
+        state.debugStage = null;
+        state.records = normalized;
+        state.dataMode = "live";
+        state.lastUpdated = new Date();
+      } catch (err) {
+        state.debugStage = "exception: " + (err && err.message ? err.message : String(err)) + (err && err.code ? " (code: " + err.code + ")" : "");
+        state.lastError = describeError(err);
+        loadDemo();
+        state.dataMode = "error";
+      } finally {
+        setRefreshing(false);
+        updateSourceBox();
+        render();
+      }
+    })();
+  }
+
+  // Score de test de conduite au recrutement (sheet "Enregistrement
+  // chauffeurs", colonne "Score test de conduite /40"), rapproche du
+  // pipeline sinistres par nom normalise (pas d'identifiant commun entre
+  // les deux sheets). Les noms courants (Kouassi, Koffi, Diallo...) peuvent
+  // correspondre a plusieurs candidats differents dans le sheet recrutement
+  // — on utilise le numero de telephone comme signal pour distinguer un
+  // vrai doublon (meme personne, plusieurs passages de test) d'une
+  // collision (deux personnes differentes, meme nom normalise).
+  //
+  // ALIAS_MAP : correspondances manuelles nom-sinistre -> nom-recrutement
+  // pour les cas ou les deux sheets orthographient differemment le meme
+  // chauffeur (surnom, nom marital, faute de frappe...). A completer au
+  // fil de la relecture de l'onglet "Non rattachés".
+  // Exemple : "jean dupont": "jean paul dupont"
+  var ALIAS_MAP = {};
+
+  // William, 2026-09-02 : matching manuel persistant. ALIAS_MAP reste la
+  // structure en memoire consultee par lookupRecruitment (inchangee) — au
+  // chargement, on la complete avec les confirmations deja enregistrees
+  // dans la base partagee de l'artifact, et chaque nouvelle confirmation y
+  // est a la fois appliquee immediatement (en memoire) et persistee (pour
+  // survivre aux rechargements/autres viewers). confirmedOrphelins suit le
+  // meme principe pour les suggestions chauffeur-orphelin (annotation
+  // uniquement : ne modifie jamais le sheet source, voir confirmOrphelinDriver).
+  var confirmedOrphelins = {};
+
+  // William, 2026-09-03 : meme principe pour l'onglet "Déclarations" —
+  // marque une declaration-sans-sinistre comme "deja verifiee" (annotation
+  // uniquement, voir confirmDeclarationReviewed). Clef = N° Déclaration
+  // (identifiant stable du sheet assureur, contrairement a plaque+date qui
+  // peut changer si la plaque provisoire est remplacee par la definitive).
+  var reviewedDeclarations = {};
+
+  // William, 2026-09-05 : rapprochements MANUELS declaration <-> sinistre du
+  // suivi, cle = N° Déclaration (identifiant stable cote assureur, alors que
+  // plaque+date bouge quand une plaque provisoire devient definitive).
+  // Contrairement aux autres collections manuelles, l'id du document est
+  // DETERMINISTE (voir declarationDocId) plutot que genere par add() : ca
+  // rend le "Délier" possible sans devoir re-parcourir la collection pour
+  // retrouver l'id aleatoire du document a supprimer.
+  var confirmedDeclarationMatches = {};
+
+  function declarationDocId(numDeclaration) {
+    // Grammaire des segments de chemin db : lettres, chiffres et _ - . ~ : @ +
+    // uniquement (200 octets max). "SINE-2026-001" passe tel quel.
+    return String(numDeclaration).replace(/[^A-Za-z0-9_\-.~:@+]/g, "_").slice(0, 200);
+  }
+
+  // William, 2026-09-03 : ALIAS_MAP ne garde que la cle de reconciliation
+  // (sinistreDriverKey -> recruitmentKey), consultee par lookupRecruitment
+  // — insuffisant pour reconstruire une trace lisible (onglet
+  // "Rapprochements") qui a besoin du contexte complet (nom affiche des
+  // deux cotes, date de confirmation). confirmedRecruitmentMatches garde
+  // le document complet, en parallele, meme cle.
+  var confirmedRecruitmentMatches = {};
+
+  function orphelinKeyOf(o) { return o.plaque + "|" + o.dateReference; }
+
+  // William, 2026-09-05 : tous les rapprochements confirmes jusqu'ici l'ont
+  // ete sur la base d'un tel/permis cote SINISTRES qui pouvait appartenir a
+  // un AUTRE chauffeur ayant tenu la meme plaque avant/apres (bug corrige le
+  // 2026-09-05 dans src/clustering-nouvelle-appli.js : tel/permis desormais
+  // resolus par driverId, plus par "derniere valeur vue sur la plaque").
+  // William les a donc declares obsoletes ("obsoletes pour la plupart") et
+  // demande leur suppression.
+  //
+  // Declenchement MANUEL (bouton dans l'onglet "Rapprochements"), pas
+  // automatique au chargement : ce qui compte ici c'est le MOMENT de la
+  // purge. Les rapprochements ne redeviennent fiables qu'une fois le sheet
+  // reecrit par le pipeline corrige (redeploiement de Logic.gs + run) —
+  // date que cette page ne peut pas connaitre. Purger automatiquement au
+  // premier chargement viderait peut-etre AVANT que les donnees soient
+  // corrigees, laissant William refaire des rapprochements encore faux qui,
+  // eux, survivraient. Le bouton lui laisse le controle de l'instant, et
+  // reste reutilisable s'il veut repartir de zero plus tard.
+  //
+  // Chaque document est COPIE dans <collection>_archive avant suppression :
+  // le travail manuel de William n'est jamais detruit sans copie, et reste
+  // recuperable (aucune UI ne le lit, mais la donnee est toujours la).
+  var PURGE_COLLECTIONS = ["recruitment_matches", "orphelin_matches"];
+
+  // Etat du bouton de purge — la confirmation et le compte-rendu se font
+  // DANS la page. William, 2026-09-05 : la version precedente s'appuyait sur
+  // window.confirm()/window.alert(), or la page tourne dans l'iframe
+  // sandboxee du viewer d'artifact, ou les modales natives sont ignorees :
+  // confirm() renvoyait false sans rien afficher, purgeMatchesFromUi()
+  // n'etait donc JAMAIS appelee et le bouton paraissait inerte. Constate en
+  // base le 2026-09-05 : 25 documents toujours dans recruitment_matches et
+  // recruitment_matches_archive vide, c'est-a-dire aucune tentative.
+  var purgeUi = { armed: false, busy: false, message: null, isError: false };
+
+  // William, 2026-09-05 : l'artefact est desormais partage en lecture a
+  // l'organisation, l'ECRITURE restant reservee au proprietaire (regles db
+  // declarees a la publication). Un lecteur qui clique "Confirmer"/"Lier"
+  // voit donc son enregistrement refuse cote base — jusqu'ici les catch
+  // avalaient l'erreur en silence : le rapprochement apparaissait, puis
+  // disparaissait au rechargement, sans la moindre explication. On le dit.
+  var persistError = null;
+
+  function describePersistError(e) {
+    var code = e && e.code;
+    if (code === "invalid_argument") {
+      return "Enregistrement refusé : ce compte est en lecture seule sur ce dashboard (l'écriture est réservée au propriétaire de l'artéfact). Ce que tu viens de confirmer reste affiché pour cette session, mais ne sera pas conservé.";
+    }
+    if (code === "not_granted" || code === "capability_disabled" || code === "capability_removed") {
+      return "Enregistrement impossible : la base n'est pas disponible dans cette session. Les confirmations restent en mémoire jusqu'au rechargement.";
+    }
+    if (code === "quota_exceeded" || code === "resource_exhausted") {
+      return "Enregistrement impossible (" + code + ") : la base a atteint une limite. Les confirmations restent en mémoire jusqu'au rechargement.";
+    }
+    return "Enregistrement non conservé (" + (code || (e && e.message) || "erreur inconnue") + ") — la confirmation reste en mémoire jusqu'au rechargement.";
+  }
+
+  function notePersistFailure(e) {
+    persistError = describePersistError(e);
+    render();
+  }
+
+  // Archive en UN SEUL document par purge (au lieu d'un document par ligne
+  // dans <collection>_archive) : une seule ecriture au lieu de N, donc une
+  // seule occasion d'echouer, et ca ne grignote pas le quota de 5000
+  // documents de la base de l'artifact. Quelques centaines d'octets par
+  // rapprochement — tres loin de la limite de 256 Kio par document.
+  //
+  // L'ordre est deliberement archive-PUIS-supprime, et l'echec de l'archive
+  // remonte (au lieu d'etre avale) : rien n'est jamais supprime sans copie.
+  async function purgeAllMatches(db) {
+    var snapshots = [];
+    for (var i = 0; i < PURGE_COLLECTIONS.length; i++) {
+      var name = PURGE_COLLECTIONS[i];
+      var snap = await db.collection(name).get();
+      snapshots.push({ name: name, docs: snap.docs.slice() });
+    }
+
+    var rows = {}, total = 0;
+    snapshots.forEach(function (s) {
+      rows[s.name] = s.docs.map(function (doc) {
+        return Object.assign({ _id: doc.id }, doc.data() || {});
+      });
+      total += s.docs.length;
+    });
+    if (total === 0) return { purged: 0, failed: 0, archiveId: null };
+
+    var archiveId = "purge-" + Date.now();
+    await db.doc("purge_archive/" + archiveId).set({
+      archivedAt: new Date().toISOString(),
+      archivedReason: "purge manuelle depuis l'onglet Rapprochements",
+      count: total,
+      rows: rows
+    });
+
+    // Les echecs de suppression sont comptes, pas propages : une ligne qui
+    // resiste ne doit pas empecher les suivantes d'etre supprimees. Le
+    // compte-rendu invite alors a recliquer (l'archive est deja faite, et
+    // supprimer est idempotent).
+    var purged = 0, failed = 0;
+    for (var k = 0; k < snapshots.length; k++) {
+      var s2 = snapshots[k];
+      for (var j = 0; j < s2.docs.length; j++) {
+        try {
+          await db.doc(s2.name + "/" + s2.docs[j].id).delete();
+          purged++;
+        } catch (e) {
+          failed++;
+        }
+      }
+    }
+    return { purged: purged, failed: failed, archiveId: archiveId };
+  }
+
+  // Vide la base ET l'etat en memoire, puis re-rend — sans rechargement de
+  // page, pour que le resultat soit visible immediatement.
+  function purgeMatchesFromUi() {
+    purgeUi.busy = true;
+    purgeUi.armed = false;
+    purgeUi.message = null;
+    purgeUi.isError = false;
+    render();
+    (async function () {
+      var res;
+      try {
+        var db = await window.claude.use("db");
+        if (!db) throw { message: "base indisponible dans cette session" };
+        res = await purgeAllMatches(db);
+      } catch (e) {
+        purgeUi.busy = false;
+        purgeUi.isError = true;
+        purgeUi.message = "Purge impossible (" +
+          (e && e.message ? e.message : (e && e.code ? e.code : String(e))) +
+          ") — rien n'a été supprimé.";
+        render();
+        return;
+      }
+      // ALIAS_MAP : on ne retire QUE les cles issues des confirmations
+      // manuelles, jamais d'eventuelles entrees codees en dur.
+      Object.keys(confirmedRecruitmentMatches).forEach(function (k) {
+        delete ALIAS_MAP[k];
+        delete confirmedRecruitmentMatches[k];
+      });
+      Object.keys(confirmedOrphelins).forEach(function (k) { delete confirmedOrphelins[k]; });
+      purgeUi.busy = false;
+      purgeUi.isError = res.failed > 0;
+      purgeUi.message = (res.purged === 0 && res.failed === 0)
+        ? "Rien à supprimer."
+        : res.purged + " rapprochement(s) supprimé(s)" +
+          (res.archiveId ? ", archivés dans purge_archive/" + res.archiveId : "") +
+          (res.failed ? " — " + res.failed + " suppression(s) en échec, reclique pour réessayer." : ".");
+      render();
+    })();
+  }
+
+  function confirmDeclarationMatch(numDeclaration, sinistreId, plaque, dateReference, sinistreName) {
+    var doc = {
+      numDeclaration: numDeclaration, sinistreId: sinistreId,
+      plaque: plaque, dateReference: dateReference, sinistreName: sinistreName || null,
+      confirmedAt: new Date().toISOString()
+    };
+    confirmedDeclarationMatches[numDeclaration] = doc; // effet immediat
+    render();
+    (async function () {
+      try {
+        var db = await window.claude.use("db");
+        if (!db) return;
+        await db.doc("declaration_matches/" + declarationDocId(numDeclaration)).set(doc);
+      } catch (e) {
+        notePersistFailure(e);
+      }
+    })();
+  }
+
+  function unlinkDeclarationMatch(numDeclaration) {
+    delete confirmedDeclarationMatches[numDeclaration];
+    render();
+    (async function () {
+      try {
+        var db = await window.claude.use("db");
+        if (!db) return;
+        await db.doc("declaration_matches/" + declarationDocId(numDeclaration)).delete();
+      } catch (e) {
+        notePersistFailure(e); // idem : retire en memoire pour cette session.
+      }
+    })();
+  }
+
+  function loadManualMatches() {
+    (async function () {
+      try {
+        var db = await window.claude.use("db");
+        if (!db) return;
+        var matchesSnap = await db.collection("recruitment_matches").get();
+        matchesSnap.docs.forEach(function (doc) {
+          var d = doc.data();
+          if (d && d.sinistreDriverKey && d.recruitmentKey) {
+            ALIAS_MAP[d.sinistreDriverKey] = d.recruitmentKey;
+            confirmedRecruitmentMatches[d.sinistreDriverKey] = d;
+          }
+        });
+        var orphelinsSnap = await db.collection("orphelin_matches").get();
+        orphelinsSnap.docs.forEach(function (doc) {
+          var d = doc.data();
+          if (d && d.orphelinKey) confirmedOrphelins[d.orphelinKey] = d;
+        });
+        var declSnap = await db.collection("declaration_reviewed").get();
+        declSnap.docs.forEach(function (doc) {
+          var d = doc.data();
+          if (d && d.numDeclaration) reviewedDeclarations[d.numDeclaration] = d;
+        });
+        var declMatchSnap = await db.collection("declaration_matches").get();
+        declMatchSnap.docs.forEach(function (doc) {
+          var d = doc.data();
+          if (d && d.numDeclaration && d.sinistreId) confirmedDeclarationMatches[d.numDeclaration] = d;
+        });
+        render();
+      } catch (e) {
+        // db indisponible (capacite non chargee/revoquee/hors org) — degrade
+        // en silence, ALIAS_MAP reste tel quel (juste les entrees en dur).
+      }
+    })();
+  }
+
+  function confirmRecruitmentMatch(sinistreDriverKey, sinistreName, recruitmentKey, recruitmentName) {
+    ALIAS_MAP[sinistreDriverKey] = recruitmentKey; // effet immediat, avant meme la confirmation d'ecriture
+    var confirmedAt = new Date().toISOString();
+    confirmedRecruitmentMatches[sinistreDriverKey] = {
+      sinistreDriverKey: sinistreDriverKey, sinistreName: sinistreName,
+      recruitmentKey: recruitmentKey, recruitmentName: recruitmentName,
+      confirmedAt: confirmedAt
+    };
+    render();
+    (async function () {
+      try {
+        var db = await window.claude.use("db");
+        if (!db) return;
+        await db.collection("recruitment_matches").add({
+          sinistreDriverKey: sinistreDriverKey, sinistreName: sinistreName,
+          recruitmentKey: recruitmentKey, recruitmentName: recruitmentName,
+          confirmedAt: confirmedAt
+        });
+      } catch (e) {
+        // Persistance echouee : le mapping reste actif en memoire pour cette
+        // session mais ne survivra pas au rechargement — desormais dit a
+        // l'ecran (voir notePersistFailure) au lieu d'echouer en silence.
+        notePersistFailure(e);
+      }
+    })();
+  }
+  window.confirmRecruitmentMatch = confirmRecruitmentMatch;
+
+  function confirmOrphelinDriver(o) {
+    var key = orphelinKeyOf(o);
+    confirmedOrphelins[key] = { orphelinKey: key, plaque: o.plaque, dateReference: o.dateReference, suggestedName: o.suggestedName, confirmedAt: new Date().toISOString() };
+    render();
+    (async function () {
+      try {
+        var db = await window.claude.use("db");
+        if (!db) return;
+        await db.collection("orphelin_matches").add(confirmedOrphelins[key]);
+      } catch (e) {
+        notePersistFailure(e); // idem : en memoire pour cette session seulement.
+      }
+    })();
+  }
+  window.confirmOrphelinDriver = confirmOrphelinDriver;
+
+  function confirmDeclarationReviewed(numDeclaration) {
+    reviewedDeclarations[numDeclaration] = { numDeclaration: numDeclaration, reviewedAt: new Date().toISOString() };
+    render();
+    (async function () {
+      try {
+        var db = await window.claude.use("db");
+        if (!db) return;
+        await db.collection("declaration_reviewed").add(reviewedDeclarations[numDeclaration]);
+      } catch (e) {
+        notePersistFailure(e); // idem : en memoire pour cette session seulement.
+      }
+    })();
+  }
+  window.confirmDeclarationReviewed = confirmDeclarationReviewed;
+
+  // Delegation d'evenements (jamais d'onclick inline avec des noms/valeurs
+  // qui peuvent contenir apostrophes/guillemets — data-* + esc() suffit a
+  // afficher, la delegation lit les valeurs deja desechappees par le DOM).
+  // Delegation attachee UNE FOIS sur le panel (pas sur les boutons/inputs,
+  // recrees a chaque render()) — panel.dataset.confirmWired evite le double
+  // cablage. William, 2026-09-02 : couvre aussi la recherche libre
+  // (evenement "input" sur .driver-search) en plus des boutons Confirmer.
+  function wireConfirmButtons(panel) {
+    if (!panel || panel.dataset.confirmWired) return;
+    panel.dataset.confirmWired = "1";
+
+    panel.addEventListener("click", function (e) {
+      var recruitBtn = e.target.closest("[data-confirm-recruitment]");
+      if (recruitBtn) {
+        confirmRecruitmentMatch(
+          recruitBtn.getAttribute("data-driver-key"), recruitBtn.getAttribute("data-driver-name"),
+          recruitBtn.getAttribute("data-recruitment-key"), recruitBtn.getAttribute("data-recruitment-name")
+        );
+        return;
+      }
+      var orphBtn = e.target.closest("[data-confirm-orphelin]");
+      if (orphBtn) {
+        confirmOrphelinDriver({
+          plaque: orphBtn.getAttribute("data-plaque"), dateReference: orphBtn.getAttribute("data-date-reference"),
+          suggestedName: orphBtn.getAttribute("data-suggested-name")
+        });
+        return;
+      }
+      var declBtn = e.target.closest("[data-confirm-declaration]");
+      if (declBtn) {
+        confirmDeclarationReviewed(declBtn.getAttribute("data-declaration-num"));
+        return;
+      }
+      var exportBtn2 = e.target.closest("[data-export-rapprochements-csv]");
+      if (exportBtn2) {
+        if (!exportBtn2.disabled) exportRapprochementsCsv();
+        return;
+      }
+      // Purge en DEUX CLICS dans la page (armer puis confirmer) — voir
+      // purgeUi : les modales natives sont ignorees dans l'iframe du viewer.
+      var purgeAsk = e.target.closest("[data-purge-rapprochements]");
+      if (purgeAsk) {
+        if (!purgeAsk.disabled) { purgeUi.armed = true; purgeUi.message = null; render(); }
+        return;
+      }
+      var purgeGo = e.target.closest("[data-purge-rapprochements-confirm]");
+      if (purgeGo) { purgeMatchesFromUi(); return; }
+      var purgeCancel = e.target.closest("[data-purge-rapprochements-cancel]");
+      if (purgeCancel) { purgeUi.armed = false; purgeUi.message = null; render(); return; }
+      var linkBtn = e.target.closest("[data-link-declaration]");
+      if (linkBtn) {
+        confirmDeclarationMatch(
+          linkBtn.getAttribute("data-declaration-num"), linkBtn.getAttribute("data-sinistre-id"),
+          linkBtn.getAttribute("data-plaque"), linkBtn.getAttribute("data-date-reference"),
+          linkBtn.getAttribute("data-sinistre-name")
+        );
+        return;
+      }
+      var unlinkBtn = e.target.closest("[data-unlink-declaration]");
+      if (unlinkBtn) {
+        unlinkDeclarationMatch(unlinkBtn.getAttribute("data-declaration-num"));
+        return;
+      }
+      // William, 2026-09-03 : bascule le champ que la recherche libre
+      // compare (nom/tel/permis/naissance) — re-render pour mettre a jour
+      // l'etat visuel des boutons (aria-selected) ; les resultats de
+      // recherche deja affiches se reinitialisent (vide), il suffit de
+      // retaper/re-cliquer dans la barre.
+      var modeBtn = e.target.closest("[data-search-mode]");
+      if (modeBtn) {
+        state.unmatchedSearchMode = modeBtn.getAttribute("data-search-mode");
+        render();
+      }
+    });
+
+    // Recherche libre parmi TOUS les chauffeurs recrutement (deja deduplique
+    // par driverKey normalise dans buildRecruitmentIndex — pas seulement les
+    // 3 suggestions fuzzy). Resultats places dans le <div> juste apres
+    // l'input (meme <li>), pas besoin de re-cabler a chaque frappe.
+    panel.addEventListener("input", function (e) {
+      // Recherche d'un SINISTRE a lier a une declaration (onglet
+      // "Déclarations") — William, 2026-09-05.
+      var declInput = e.target.closest("[data-declaration-search]");
+      if (declInput) {
+        var declResults = declInput.nextElementSibling;
+        if (!declResults) return;
+        var num = declInput.getAttribute("data-declaration-num");
+        var hits = searchSinistres(declInput.value, state.lastFiltered || []);
+        declResults.innerHTML = declInput.value.trim() === ""
+          ? ""
+          : (hits.length
+            ? '<ul class="fuzzy-candidates">' + hits.map(function (r) {
+                return "<li><span>" + sinistreLabel(r) + "</span>" +
+                  "<span class=\"muted\">" + linkSinistreButton({ numDeclaration: num }, r, "Lier") + "</span></li>";
+              }).join("") + "</ul>"
+            : '<div class="chart-note" style="margin:4px 0 0">Aucun sinistre trouvé dans la sélection actuelle.</div>');
+        return;
+      }
+      var input = e.target.closest("[data-driver-search]");
+      if (!input) return;
+      var resultsEl = input.nextElementSibling;
+      if (!resultsEl) return;
+      var driverKey = input.getAttribute("data-driver-key");
+      var driverName = input.getAttribute("data-driver-name");
+      var query = input.value.trim();
+      if (!query) { resultsEl.innerHTML = ""; return; }
+      var results = searchRecruitment(query, state.unmatchedSearchMode);
+      resultsEl.innerHTML = results.length
+        ? '<ul class="fuzzy-candidates">' + results.map(function (r) {
+            var phones = Object.keys(r.entry.phones || {});
+            var permits = Object.keys(r.entry.permits || {});
+            return "<li><span>" + esc(r.entry.displayName) + "</span>" +
+              "<span class=\"muted\">note: " + fmtScore(r.entry.score) + " · assignation: " + fmtDate(r.entry.assignedDate) +
+              (phones.length ? " · tél: " + phones.map(esc).join(", ") : "") +
+              (permits.length ? " · permis: " + permits.map(esc).join(", ") : "") +
+              (r.entry.birthDate ? " · né(e): " + fmtDate(r.entry.birthDate) : "") +
+              (r.entry.residence ? " · habite: " + esc(r.entry.residence) : "") +
+              " · <button type=\"button\" data-confirm-recruitment data-driver-key=\"" + esc(driverKey) + "\" data-driver-name=\"" + esc(driverName) + "\" data-recruitment-key=\"" + esc(r.key) + "\" data-recruitment-name=\"" + esc(r.entry.displayName) + "\">Lier</button>" +
+              "</span></li>";
+          }).join("") + "</ul>"
+        : '<div class="chart-note" style="margin:4px 0 0">Aucun résultat.</div>';
+    });
+  }
+
+  // Recherche substring sur le nom normalise, parmi TOUS les chauffeurs du
+  // sheet recrutement (deja synchronise avec PITLANE via syncEnregistrement.gs
+  // — confirme actif le 2026-09-02) — pas limite aux candidats fuzzy.
+  // buildRecruitmentIndex deduplique deja par driverKey normalise, donc pas
+  // de doublons meme si le sheet a plusieurs lignes pour la meme personne.
+  // William, 2026-09-03 : recherche libre par nom (comportement d'origine)
+  // OU par telephone/permis/date de naissance — mode choisi via le
+  // selecteur au-dessus de la liste (state.unmatchedSearchMode), utile
+  // quand deux personnes portent des noms tres proches (voir capture :
+  // "Gaoussou" x3) mais que tel/permis/naissance permettent de trancher
+  // sans ambiguite.
+  function searchRecruitment(query, mode) {
+    var byKey = state.recruitment.byKey || {};
+    var raw = String(query || "").trim();
+    if (!raw) return [];
+
+    if (mode === "phone") {
+      var digits = raw.replace(/[^0-9]/g, "");
+      if (!digits) return [];
+      return Object.keys(byKey)
+        .filter(function (key) {
+          return Object.keys(byKey[key].phones || {}).some(function (v) {
+            return String(v).replace(/[^0-9]/g, "").indexOf(digits) !== -1;
+          });
+        })
+        .map(function (key) { return { key: key, entry: byKey[key] }; })
+        .sort(function (a, b) { return a.entry.displayName.localeCompare(b.entry.displayName); })
+        .slice(0, 8);
+    }
+
+    if (mode === "permit") {
+      // William, 2026-09-03 : un numero de permis ivoirien melange lettres
+      // et chiffres (ex: "YARO011830106011M") — les lettres du prefixe
+      // portent une vraie info discriminante. Un match digits-only (comme
+      // pour le telephone, ou les lettres ne sont que du formatage) genere
+      // de faux positifs frequents : n'importe quel permis dont la portion
+      // numerique contient par hasard la meme sous-sequence de chiffres
+      // remonte, noyant le bon resultat parmi les 8 candidats affiches.
+      var normPermit = raw.replace(/[^a-z0-9]/gi, "").toLowerCase();
+      if (!normPermit) return [];
+      return Object.keys(byKey)
+        .filter(function (key) {
+          return Object.keys(byKey[key].permits || {}).some(function (v) {
+            return String(v).replace(/[^a-z0-9]/gi, "").toLowerCase().indexOf(normPermit) !== -1;
+          });
+        })
+        .map(function (key) { return { key: key, entry: byKey[key] }; })
+        .sort(function (a, b) { return a.entry.displayName.localeCompare(b.entry.displayName); })
+        .slice(0, 8);
+    }
+
+    if (mode === "birthDate") {
+      var qd = raw.toLowerCase();
+      return Object.keys(byKey)
+        .filter(function (key) { return byKey[key].birthDate && String(byKey[key].birthDate).toLowerCase().indexOf(qd) !== -1; })
+        .map(function (key) { return { key: key, entry: byKey[key] }; })
+        .sort(function (a, b) { return a.entry.displayName.localeCompare(b.entry.displayName); })
+        .slice(0, 8);
+    }
+
+    // mode "name" (defaut)
+    var q = normalizeDriverName(raw);
+    if (!q) return [];
+    return Object.keys(byKey)
+      .filter(function (key) { return key.indexOf(q) !== -1; })
+      .map(function (key) { return { key: key, entry: byKey[key] }; })
+      .sort(function (a, b) { return a.entry.displayName.localeCompare(b.entry.displayName); })
+      .slice(0, 8);
+  }
+
+  function buildRecruitmentIndex(rows) {
+    var byKey = {};
+    rows.forEach(function (row) {
+      var name = pick(row, ["NOM & PRÉNOMS", "Nom formulaire"]);
+      var scoreRaw = pick(row, ["Score test de conduite /40"]);
+      var phone = pick(row, ["Numéro de téléphone"]);
+      // William, 2026-09-02, colonne I — pour rapprochement manuel avec
+      // Licence Number cote sinistres dans "Non rattachés".
+      var permit = pick(row, ["Numéro de permis"]);
+      var assignedDate = pick(row, ["Date de l'assignation"]);
+      // William, 2026-09-03 : colonne A du sheet recrutement — date de
+      // passage/inscription du candidat, distincte de "Date de
+      // l'assignation" (bien plus tardive, quand un vehicule lui est
+      // attribue). Signal de proximite supplementaire pour le matching
+      // automatique (voir multiSignalCandidates).
+      var registrationDate = pick(row, ["DATE"]);
+      // William, 2026-09-02 — synchronises depuis PITLANE via syncEnregistrement.gs
+      // (confirme actif) : reperes supplementaires pour confirmer visuellement
+      // qu'un rapprochement fuzzy est la meme personne.
+      var birthDate = pick(row, ["Date de naissance"]);
+      var residence = pick(row, ["Lieu d'habitation"]);
+      // William, 2026-09-02 : la note de test n'est plus obligatoire pour
+      // rattacher un chauffeur — beaucoup de chauffeurs recrutement n'ont
+      // jamais passe le test ou n'ont pas encore de score, mais doivent
+      // quand meme pouvoir etre cherches/lies dans "Non rattachés" (le but
+      // du rattachement est l'identite, pas la note).
+      if (!name) return;
+      var scoreNum = scoreRaw !== null ? Number(scoreRaw) : null;
+      if (scoreNum !== null && isNaN(scoreNum)) scoreNum = null;
+      var key = normalizeDriverName(name);
+      if (!key) return;
+      if (!byKey[key]) byKey[key] = { scores: [], phones: {}, permits: {}, displayName: name, assignedDate: null, registrationDate: null, birthDate: null, residence: null };
+      if (scoreNum !== null) byKey[key].scores.push(scoreNum);
+      byKey[key].displayName = name;
+      if (assignedDate) byKey[key].assignedDate = assignedDate;
+      if (registrationDate) byKey[key].registrationDate = registrationDate;
+      if (phone) byKey[key].phones[String(phone).trim()] = true;
+      if (permit) byKey[key].permits[String(permit).trim()] = true;
+      // William, 2026-09-03 : "Date de naissance" contient tres souvent un
+      // AGE saisi par erreur a la place d'une date (confirme sur le sheet
+      // live : ~65% des valeurs non-vides, ex. "47", "36") — on ne garde
+      // que ce qui ressemble vraiment a une date (JJ/MM/AAAA), sinon la
+      // recherche/l'affichage "né(e): 47" induit en erreur pour rien.
+      if (birthDate && /^\d{1,2}\/\d{1,2}\/\d{2,4}$/.test(String(birthDate).trim())) byKey[key].birthDate = birthDate;
+      if (residence) byKey[key].residence = residence;
+    });
+    Object.keys(byKey).forEach(function (key) {
+      var entry = byKey[key];
+      var phoneCount = Object.keys(entry.phones).length;
+      // Sans numero de telephone on ne peut pas distinguer un doublon d'une
+      // collision — on suppose alors une seule personne (limite connue).
+      entry.distinctPeople = phoneCount > 0 ? phoneCount : 1;
+      entry.score = entry.scores.length ? entry.scores[entry.scores.length - 1] : null;
+    });
+    return byKey;
+  }
+
+  // Renvoie { confidence: "exact"|"alias"|"ambiguous"|"none", score } pour
+  // un driverKey donne du pipeline sinistres.
+  function lookupRecruitment(driverKey) {
+    var byKey = state.recruitment.byKey || {};
+    var viaAlias = ALIAS_MAP.hasOwnProperty(driverKey);
+    var key = viaAlias ? ALIAS_MAP[driverKey] : driverKey;
+    var entry = byKey[key];
+    if (!entry) return { confidence: "none", score: null };
+    if (entry.distinctPeople > 1) return { confidence: "ambiguous", score: entry.score };
+    return { confidence: viaAlias ? "alias" : "exact", score: entry.score };
+  }
+
+  // Distance de Levenshtein classique (programmation dynamique 1D) —
+  // utilisee pour suggerer des rapprochements approximatifs (surnom, faute
+  // de frappe, nom marital) sur l'onglet "Non rattachés", sans jamais les
+  // appliquer automatiquement : c'est une SUGGESTION a valider par William,
+  // qui l'ajoute ensuite a ALIAS_MAP si elle est correcte.
+  function levenshtein(a, b) {
+    var m = a.length, n = b.length;
+    if (m === 0) return n;
+    if (n === 0) return m;
+    var dp = new Array(n + 1);
+    for (var j = 0; j <= n; j++) dp[j] = j;
+    for (var i = 1; i <= m; i++) {
+      var prev = dp[0];
+      dp[0] = i;
+      for (j = 1; j <= n; j++) {
+        var tmp = dp[j];
+        dp[j] = Math.min(dp[j] + 1, dp[j - 1] + 1, prev + (a[i - 1] === b[j - 1] ? 0 : 1));
+        prev = tmp;
+      }
+    }
+    return dp[n];
+  }
+  function nameSimilarity(a, b) {
+    var maxLen = Math.max(a.length, b.length) || 1;
+    return 1 - levenshtein(a, b) / maxLen;
+  }
+  function fuzzyCandidates(driverKey, byKey, limit) {
+    return Object.keys(byKey)
+      .filter(function (key) { return key !== driverKey; })
+      .map(function (key) { return { key: key, sim: nameSimilarity(driverKey, key), entry: byKey[key] }; })
+      .filter(function (c) { return c.sim >= 0.55; })
+      .sort(function (a, b) { return b.sim - a.sim; })
+      .slice(0, limit || 3);
+  }
+
+  var DATE_PROXIMITY_WINDOW_DAYS = 21;
+
+  // William, 2026-09-03 : "les match ne sont fait que sur les noms [...] je
+  // veux [...] matcher tout les shifts" — union des candidats trouves par
+  // PLUSIEURS signaux independants (pas juste le nom) : telephone/permis
+  // identiques (cote sinistres, RAW_CORE_VEHICLE_DAILY colonnes K/L) cote
+  // recrutement, et proximite entre le 1er shift (sinistres) et soit la
+  // date d'inscription (colonne A du sheet recrutement) soit la date
+  // d'assignation d'un vehicule — memes heuristiques que
+  // suggestDriversForOrphelins (proximite temporelle) et searchRecruitment
+  // (comparaison alphanumerique du permis, digits du telephone). Pas de
+  // signal possible sur la date de naissance : aucune donnee de naissance
+  // cote sinistres pour comparer (elle reste affichee, juste pas
+  // declencheuse d'un match automatique).
+  //
+  // d = un chauffeur sinistre sans correspondance (driverKey, phone,
+  // licenceNumber, firstShiftDate). byKey = index recrutement.
+  function multiSignalCandidates(d, byKey, limit) {
+    var candidates = {}; // key -> { key, entry, reasons: [], bestScore }
+
+    function addCandidate(key, reason, score) {
+      if (key === d.driverKey) return;
+      var entry = byKey[key];
+      if (!entry) return;
+      if (!candidates[key]) candidates[key] = { key: key, entry: entry, reasons: [], bestScore: 0 };
+      candidates[key].reasons.push(reason);
+      if (score > candidates[key].bestScore) candidates[key].bestScore = score;
+    }
+
+    // 1. Nom (ressemblance existante, surnom/faute de frappe/nom marital).
+    Object.keys(byKey).forEach(function (key) {
+      var sim = nameSimilarity(d.driverKey, key);
+      if (sim >= 0.55) addCandidate(key, "nom (" + Math.round(sim * 100) + "% ressemblance)", sim);
+    });
+
+    // 2. Telephone identique (sous-chaine de chiffres, comme searchRecruitment).
+    if (d.phone) {
+      var phoneDigits = String(d.phone).replace(/[^0-9]/g, "");
+      if (phoneDigits) {
+        Object.keys(byKey).forEach(function (key) {
+          var hit = Object.keys(byKey[key].phones || {}).some(function (v) {
+            var vDigits = String(v).replace(/[^0-9]/g, "");
+            return vDigits && (vDigits.indexOf(phoneDigits) !== -1 || phoneDigits.indexOf(vDigits) !== -1);
+          });
+          if (hit) addCandidate(key, "téléphone identique", 1);
+        });
+      }
+    }
+
+    // 3. Permis identique (alphanumerique complet — voir fix 2026-09-03,
+    // ne PAS reduire aux chiffres seuls, le prefixe de lettres est
+    // discriminant sur un permis ivoirien).
+    if (d.licenceNumber) {
+      var permitNorm = String(d.licenceNumber).replace(/[^a-z0-9]/gi, "").toLowerCase();
+      if (permitNorm) {
+        Object.keys(byKey).forEach(function (key) {
+          var hit = Object.keys(byKey[key].permits || {}).some(function (v) {
+            var vNorm = String(v).replace(/[^a-z0-9]/gi, "").toLowerCase();
+            return vNorm && (vNorm.indexOf(permitNorm) !== -1 || permitNorm.indexOf(vNorm) !== -1);
+          });
+          if (hit) addCandidate(key, "permis identique", 1);
+        });
+      }
+    }
+
+    // 4. Proximite de date : 1er shift (sinistres) proche de la date
+    // d'inscription (colonne A) OU de la date d'assignation (recrutement).
+    // Signal plus faible que telephone/permis (score < 1) — sert surtout a
+    // departager/renforcer un candidat deja trouve par le nom.
+    if (d.firstShiftDate) {
+      Object.keys(byKey).forEach(function (key) {
+        [byKey[key].registrationDate, byKey[key].assignedDate].forEach(function (raw, idx) {
+          if (!raw) return;
+          var iso = parseDMY(raw);
+          if (!iso) return;
+          var gap = daysBetweenIso(d.firstShiftDate, iso);
+          if (gap === null) return;
+          var absGap = Math.abs(gap);
+          if (absGap > DATE_PROXIMITY_WINDOW_DAYS) return;
+          var label = idx === 0 ? "date d'inscription proche" : "date d'assignation proche";
+          addCandidate(key, label + " (" + absGap + "j)", 0.5 - absGap / 100);
+        });
+      });
+    }
+
+    return Object.keys(candidates)
+      .map(function (k) { return candidates[k]; })
+      .sort(function (a, b) { return b.bestScore - a.bestScore; })
+      .slice(0, limit || 5);
+  }
+
+  function loadDemoRecruitment() {
+    state.recruitment = { byKey: buildRecruitmentIndex(DEMO_RECRUITMENT), dataMode: "demo" };
+  }
+
+  function fetchRecruitmentLive() {
+    (async function () {
+      try {
+        var mcp = await window.claude.use("mcp");
+        if (!mcp) { loadDemoRecruitment(); return; }
+        // Requiert "Enregistrement chauffeurs" en premiere position des
+        // onglets de ce classeur — l'export CSV Drive prend toujours le
+        // premier onglet, jamais un onglet cible par nom (voir fetchLive).
+        var result = await mcp.callTool("Google Drive", "download_file_content", {
+          fileId: RECRUTEMENT_SPREADSHEET_ID,
+          exportMimeType: "text/csv"
+        }, { cache: { refresh: true } });
+        var file = result && result.payload;
+        if (!file || !file.content) { loadDemoRecruitment(); return; }
+        var csvText = base64ToUtf8(file.content);
+        var rows = parseCsvBlock(csvText);
+        var byKey = buildRecruitmentIndex(rows);
+        if (Object.keys(byKey).length === 0) { loadDemoRecruitment(); return; }
+        state.recruitment = { byKey: byKey, dataMode: "live" };
+      } catch (err) {
+        loadDemoRecruitment();
+      } finally {
+        // William, 2026-09-02 : l'onglet "Recrutement" a ete retire — seul
+        // "Non rattachés" depend encore de la fraicheur des donnees
+        // recrutement (via computeRecruitmentMatch), donc c'est lui qu'on
+        // re-rend une fois le fetch termine, pas l'ancien onglet disparu.
+        if (state.tab === "unmatched") render();
+      }
+    })();
+  }
+
+  // Petit jeu de secours representatif de la structure reelle (memes noms
+  // de colonnes que le sheet, y compris les codes plaque provisoires
+  // WWCIxx) — sert uniquement quand le connecteur Drive est indisponible.
+  var DEMO_DECLARATIONS = []; // vide par scripts/build-github-page.js (donnees personnelles reelles)
+
+  function loadDemoDeclarations() {
+    state.declarations = { rows: DEMO_DECLARATIONS.map(normalizeDeclaration).filter(Boolean), dataMode: "demo" };
+  }
+
+  function fetchDeclarationsLive() {
+    (async function () {
+      try {
+        var mcp = await window.claude.use("mcp");
+        if (!mcp) { loadDemoDeclarations(); return; }
+        var result = await mcp.callTool("Google Drive", "download_file_content", {
+          fileId: DECLARATIONS_SPREADSHEET_ID,
+          exportMimeType: "text/csv"
+        }, { cache: { refresh: true } });
+        var file = result && result.payload;
+        if (!file || !file.content) { loadDemoDeclarations(); return; }
+        var csvText = base64ToUtf8(file.content);
+        // Ligne 0 = en-tete groupe (3 colonnes de paiement seulement),
+        // vrais en-tetes en ligne 1 — voir parseCsvBlock.
+        var rows = parseCsvBlock(csvText, 1);
+        var declarations = rows.map(normalizeDeclaration).filter(Boolean);
+        if (declarations.length === 0) { loadDemoDeclarations(); return; }
+        state.declarations = { rows: declarations, dataMode: "live" };
+      } catch (err) {
+        loadDemoDeclarations();
+      } finally {
+        if (state.tab === "declarations") render();
+      }
+    })();
+  }
+
+  function describeError(err) {
+    var code = err && err.code;
+    var map = {
+      not_granted: "Le connecteur Google Drive n'est pas autorisé pour cette page.",
+      capability_disabled: "La lecture live n'est pas disponible dans cette session.",
+      server_not_connected: "Aucun compte Google Drive connecté — ajoutez-le dans Paramètres → Connecteurs.",
+      needs_reauth: "La connexion Google Drive a expiré — reconnectez-la dans Paramètres → Connecteurs.",
+      selection_required: "Plusieurs comptes Google Drive sont disponibles — choisissez-en un.",
+      not_in_manifest: "Cet appel n'est pas autorisé par la page.",
+      blocked_by_policy: "L'accès à Google Drive est bloqué par une politique d'organisation.",
+      tool_error: "Le connecteur Google Drive a renvoyé une erreur.",
+      server_unavailable: "Google Drive est momentanément indisponible."
+    };
+    return (code && map[code]) || "Lecture live impossible.";
+  }
+
+  function setRefreshing(on) {
+    state.refreshing = on;
+    var btn = document.getElementById("refresh-btn");
+    var icon = document.getElementById("refresh-icon");
+    var label = document.getElementById("refresh-label");
+    btn.disabled = on;
+    icon.classList.toggle("spin", on);
+    label.textContent = on ? "Actualisation…" : "Actualiser";
+  }
+
+  function updateSourceBox() {
+    var dot = document.getElementById("source-dot");
+    var text = document.getElementById("source-text");
+    dot.className = "dot " + (state.dataMode === "live" ? "live" : state.dataMode === "error" ? "error" : "demo");
+    var label = {
+      live: "Live — Immobilisations_v05/2026",
+      "live-partial": "Live (partiel) — Immobilisations_v05/2026",
+      demo: "Jeu de démonstration",
+      error: "Jeu de démonstration (erreur live)"
+    }[state.dataMode] || "Jeu de démonstration";
+    if (state.lastUpdated) label += " · " + state.lastUpdated.toLocaleTimeString("fr-FR");
+    text.textContent = label;
+  }
+
+  /* =========================================================
+     7. Wiring
+     ========================================================= */
+  function initTabs() {
+    var map = { drivers: "tab-drivers", vehicles: "tab-vehicles", dtoloc: "tab-dtoloc", unmatched: "tab-unmatched", declarations: "tab-declarations", rapprochements: "tab-rapprochements" };
+    Object.keys(map).forEach(function (key) {
+      document.getElementById(map[key]).addEventListener("click", function () {
+        state.tab = key;
+        Object.keys(map).forEach(function (k2) {
+          document.getElementById(map[k2]).setAttribute("aria-selected", String(k2 === key));
+          document.getElementById("panel-" + k2).classList.toggle("active", k2 === key);
+        });
+        render();
+      });
+    });
+  }
+
+  function initFilters() {
+    document.getElementById("f-location").addEventListener("change", function (e) { state.filters.location = e.target.value; render(); });
+    document.getElementById("f-seniority").addEventListener("change", function (e) { state.filters.seniority = e.target.value; render(); });
+    document.getElementById("f-churn").addEventListener("change", function (e) { state.filters.churn = e.target.value; render(); });
+    document.getElementById("f-from").addEventListener("change", function (e) { state.filters.from = e.target.value; render(); });
+    document.getElementById("f-to").addEventListener("change", function (e) { state.filters.to = e.target.value; render(); });
+    document.getElementById("f-reset").addEventListener("click", function () {
+      state.filters = { location: "all", seniority: "all", from: "", to: "", churn: "all" };
+      ["f-location", "f-seniority", "f-churn"].forEach(function (id) { document.getElementById(id).value = "all"; });
+      document.getElementById("f-from").value = "";
+      document.getElementById("f-to").value = "";
+      render();
+    });
+  }
+
+  function initRefresh() {
+    document.getElementById("refresh-btn").addEventListener("click", function () {
+      if (state.refreshing) return;
+      fetchLive();
+      fetchRecruitmentLive();
+      fetchDeclarationsLive();
+    });
+  }
+
+  loadDemo();
+  loadDemoRecruitment();
+  loadDemoDeclarations();
+  initTabs();
+  initFilters();
+  initRefresh();
+  updateSourceBox();
+  render();
+  // Best-effort initial live attempt — falls back to demo silently on any failure.
+  fetchLive();
+  fetchRecruitmentLive();
+  fetchDeclarationsLive();
+  loadManualMatches();
+})();
+</script>
+
+</body>
+</html>
