@@ -19,4 +19,4 @@
 //
 // Après modification : Commit changes, et la page est à jour en une minute.
 
-window.SINISTRES_CSV_URL = "https://docs.google.com/spreadsheets/d/1VMGhNhGnATAbFIsbFT2mkAEyO55ZEOcATwpf-h1xnHA/edit?gid=529647148#gid=529647148";
+window.SINISTRES_CSV_URL = "https://docs.google.com/spreadsheets/d/1VMGhNhGnATAbFIsbFT2mkAEyO55ZEOcATwpf-h1xnHA/edit?gid=277610092#gid=277610092";
