@@ -11,6 +11,7 @@
 <title>Sinistres Chauffeurs</title>
 <style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found]){display:none!important}</style>
 <style>#tab-unmatched, #tab-declarations, #tab-rapprochements { display: none !important; }</style>
+<script src="config.js"></script>
 <script>
 /* ==========================================================================
    Pont de compatibilite : reimplemente les deux capacites du viewer
@@ -21,9 +22,15 @@
 (function () {
   "use strict";
 
-  var SHEET_CSV_URLS = {
-    "1VMGhNhGnATAbFIsbFT2mkAEyO55ZEOcATwpf-h1xnHA": "https://docs.google.com/spreadsheets/d/1VMGhNhGnATAbFIsbFT2mkAEyO55ZEOcATwpf-h1xnHA/gviz/tq?tqx=out:csv&sheet=AGREGATS_PUBLIC"
-  };
+  // URL renseignee dans config.js (editable depuis github.com, sans
+  // reconstruire la page). Voir le commentaire de build-github-page.js :
+  // seule une URL "Publier sur le web" fonctionne, car elle n'expose que
+  // l'onglet AGREGATS_PUBLIC et pas le classeur entier.
+  var MASTER_FILE_ID = "1VMGhNhGnATAbFIsbFT2mkAEyO55ZEOcATwpf-h1xnHA";
+  function csvUrl() {
+    var u = window.SINISTRES_CSV_URL;
+    return (typeof u === "string" && u.indexOf("http") === 0) ? u : null;
+  }
 
   /* ---- mcp : lecture des feuilles Google publiees en CSV ---------------- */
 
@@ -41,11 +48,24 @@
   var mcpShim = {
     callTool: function (server, tool, input) {
       var fileId = input && input.fileId;
-      var url = SHEET_CSV_URLS[fileId];
+      // Seul le classeur du master (via son onglet publie AGREGATS_PUBLIC)
+      // est accessible. Les classeurs recrutement et declarations assureur
+      // ne sont volontairement pas publies : ils n'alimentent que les
+      // onglets de rapprochement nominatif, masques sur cette page.
+      if (fileId !== MASTER_FILE_ID) {
+        return Promise.reject({
+          code: "config_missing",
+          message: "Classeur non publie sur cette page (rapprochements nominatifs exclus).",
+        });
+      }
+      var url = csvUrl();
       if (!url) {
         return Promise.reject({
           code: "config_missing",
-          message: "Aucune URL CSV configuree pour le classeur " + fileId,
+          message: "URL de la feuille publiee non configuree. Dans le depot " +
+            "williamguitard-beep/sinistres-chauffeurs, editer config.js et y coller l'URL " +
+            "obtenue par Fichier > Partager > Publier sur le web, en publiant UNIQUEMENT " +
+            "l'onglet AGREGATS_PUBLIC au format CSV.",
         });
       }
       // credentials omis : on lit une feuille PUBLIEE, jamais la session
