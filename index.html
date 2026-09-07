@@ -1953,11 +1953,24 @@ document.addEventListener("DOMContentLoaded", function () {
       }).join("") + "</div>";
 
     var partA = '<div class="chart-card"><h3>Chauffeurs sinistrés sans correspondance recrutement (' + m.unmatchedDrivers.length + ')</h3>' +
-      '<div class="chart-note">Suggestions par plusieurs signaux combinés : nom (surnom, faute de frappe, nom marital), téléphone identique, permis identique, et proximité entre le 1er shift (sinistres) et la date d\'inscription ou d\'assignation (sheet recrutement) — chaque candidat affiche le(s) signal(aux) qui l\'ont fait remonter. Rien n\'est appliqué automatiquement — clique "Confirmer" une fois vérifié (persisté, survit aux rechargements). La recherche libre ci-dessous peut chercher par nom, téléphone, permis ou date de naissance — choisis le champ :</div>' +
+      '<div class="chart-note">Suggestions par plusieurs signaux combinés : nom (surnom, faute de frappe, nom marital), téléphone identique, permis identique, et proximité entre le 1er shift (sinistres) et la date d\'inscription ou d\'assignation (sheet recrutement) — chaque candidat affiche le(s) signal(aux) qui l\'ont fait remonter. Rien n\'est appliqué automatiquement — clique "Confirmer" une fois vérifié (persisté, survit aux rechargements). <strong>Classés du 1er shift le plus récent au plus ancien</strong> — les arrivées récentes sont celles qu\'on retrouve le mieux dans le sheet recrutement ; celles sans date connue sont en fin de liste. La recherche libre ci-dessous peut chercher par nom, téléphone, permis ou date de naissance — choisis le champ :</div>' +
       searchModeToggle +
       (m.unmatchedDrivers.length
         ? '<ul class="history unmatched-list">' + m.unmatchedDrivers
-            .sort(function (a, b) { return b.nbSinistres - a.nbSinistres; })
+            // William, 2026-09-07 : classe par 1er shift le PLUS RECENT
+            // d'abord (avant : par nombre de sinistres). Un chauffeur arrive
+            // recemment est celui qu'on a le plus de chances de retrouver
+            // dans le sheet recrutement, donc celui dont la liaison aboutit.
+            // Sans date connue : rejete en fin de liste, on ne peut pas le
+            // classer — le nombre de sinistres sert alors de departage,
+            // comme avant.
+            .sort(function (a, b) {
+              if (!a.firstShiftDate && !b.firstShiftDate) return b.nbSinistres - a.nbSinistres;
+              if (!a.firstShiftDate) return 1;
+              if (!b.firstShiftDate) return -1;
+              if (a.firstShiftDate !== b.firstShiftDate) return a.firstShiftDate < b.firstShiftDate ? 1 : -1;
+              return b.nbSinistres - a.nbSinistres;
+            })
             .map(function (d) {
               var candidates = multiSignalCandidates(d, byKey, 5);
               var candidatesHtml = candidates.length
