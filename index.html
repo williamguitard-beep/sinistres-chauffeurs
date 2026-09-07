@@ -10,7 +10,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sinistres Chauffeurs</title>
 <style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found]){display:none!important}</style>
-<style>#tab-unmatched, #tab-declarations, #tab-rapprochements { display: none !important; }</style>
+<style>#tab-drivers, #tab-vehicles, #tab-unmatched, #tab-declarations, #tab-rapprochements { display: none !important; }</style>
 <script src="config.js"></script>
 <script>
 /* ==========================================================================
@@ -786,17 +786,17 @@ document.addEventListener("DOMContentLoaded", function () {
   </section>
 
   <nav class="tabs" role="tablist" aria-label="Vues">
-    <button class="tab" id="tab-drivers" role="tab" aria-selected="true">Classement chauffeurs</button>
+    <button class="tab" id="tab-drivers" role="tab" aria-selected="false">Classement chauffeurs</button>
     <button class="tab" id="tab-vehicles" role="tab" aria-selected="false">Vue véhicule</button>
-    <button class="tab" id="tab-dtoloc" role="tab" aria-selected="false">DTO vs Location</button>
+    <button class="tab" id="tab-dtoloc" role="tab" aria-selected="true">DTO vs Location</button>
     <button class="tab" id="tab-unmatched" role="tab" aria-selected="false">Non rattachés</button>
     <button class="tab" id="tab-declarations" role="tab" aria-selected="false">Déclarations</button>
     <button class="tab" id="tab-rapprochements" role="tab" aria-selected="false">Rapprochements</button>
   </nav>
 
-  <section class="panel active" id="panel-drivers"></section>
+  <section class="panel" id="panel-drivers"></section>
   <section class="panel" id="panel-vehicles"></section>
-  <section class="panel" id="panel-dtoloc"></section>
+  <section class="panel active" id="panel-dtoloc"></section>
   <section class="panel" id="panel-unmatched"></section>
   <section class="panel" id="panel-declarations"></section>
   <section class="panel" id="panel-rapprochements"></section>
@@ -847,7 +847,7 @@ document.addEventListener("DOMContentLoaded", function () {
     dataMode: "demo", // "demo" | "live" | "live-partial"
     lastUpdated: null,
     filters: { location: "all", seniority: "all", from: "", to: "", churn: "all" },
-    tab: "drivers",
+    tab: "dtoloc",
     sort: { drivers: { key: "nbSinistresDriver", dir: -1 }, vehicles: { key: "nbSinistresVehicule", dir: -1 } },
     expandedDriver: null,
     expandedVehicle: null,
