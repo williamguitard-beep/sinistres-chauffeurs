@@ -1118,11 +1118,34 @@ document.addEventListener("DOMContentLoaded", function () {
         R3-R5 in spirit, but recomputed on the filtered set so the
         dashboard reflects whatever period/filters are active).
      ========================================================= */
+  // William, 2026-09-08 : "sur le count des recidives, il faut enlever le
+  // garage du count."
+  //
+  // Certaines cles de chauffeur ne designent PAS une personne :
+  //  - "inconnu", la sentinelle des sinistres dont le conducteur n'a pas ete
+  //    identifie. Mesure sur le master live : 34 lignes, mises en commun sous
+  //    cette seule cle — elles ressortaient donc comme UN chauffeur de 34
+  //    sinistres, soit 33 fausses recidives a lui seul. Sur l'onglet publie,
+  //    14 de ces lignes formaient deja le plus gros "recidiviste" de la page.
+  //  - "garage", le pseudo-conducteur de l'ancienne appli (Driver ID
+  //    0x1x2x3x4x6, 658 lignes de planning) : un vehicule immobilise a
+  //    l'atelier y est rattache faute de chauffeur.
+  //
+  // Un tel groupe n'a ni anciennete, ni recidive, ni classement : les
+  // compter revient a inventer un chauffeur accidentogene qui n'existe pas.
+  // Ces lignes restent bien dans TOUS les totaux de sinistres — c'est
+  // uniquement leur lecture "par chauffeur" qui est neutralisee.
+  var NON_DRIVER_KEYS = { "inconnu": true, "garage": true, "null": true };
+
+  function isRealDriver(driverKey) {
+    return !!driverKey && !NON_DRIVER_KEYS[String(driverKey).toLowerCase()];
+  }
+
   function withCounters(records) {
     var byVeh = {}, byDrv = {};
     records.forEach(function (r) {
       byVeh[r.plaque] = (byVeh[r.plaque] || 0) + 1;
-      byDrv[r.driverKey] = (byDrv[r.driverKey] || 0) + 1;
+      if (isRealDriver(r.driverKey)) byDrv[r.driverKey] = (byDrv[r.driverKey] || 0) + 1;
     });
     // William, 2026-09-03 : rangSinistreVehicule/rangSinistreDriver (1er,
     // 2e, 3e sinistre... du meme plaque/chauffeur) n'etaient JAMAIS
@@ -1140,7 +1163,7 @@ document.addEventListener("DOMContentLoaded", function () {
     sorted.forEach(function (r) {
       rangByVeh[r.plaque] = (rangByVeh[r.plaque] || 0) + 1;
       var rangD = null;
-      if (r.driverKey) {
+      if (isRealDriver(r.driverKey)) {
         rangByDrv[r.driverKey] = (rangByDrv[r.driverKey] || 0) + 1;
         rangD = rangByDrv[r.driverKey];
       }
@@ -1150,7 +1173,7 @@ document.addEventListener("DOMContentLoaded", function () {
       var rang = rangBySinistreId[r.sinistreId] || {};
       return Object.assign({}, r, {
         nbSinistresVehicule: byVeh[r.plaque],
-        nbSinistresDriver: byDrv[r.driverKey],
+        nbSinistresDriver: byDrv[r.driverKey] || 0,
         rangSinistreVehicule: rang.v || null,
         rangSinistreDriver: rang.d || null
       });
@@ -1289,6 +1312,11 @@ document.addEventListener("DOMContentLoaded", function () {
   function renderDrivers(filtered) {
     var byDriver = {};
     filtered.forEach(function (r) {
+      // Meme regle que withCounters : un groupe qui n'est pas une personne
+      // ("inconnu", "garage") n'a pas sa place dans un classement de
+      // chauffeurs — il y figurait en tete, avec le cumul de toutes les
+      // lignes non identifiees.
+      if (!isRealDriver(r.driverKey)) return;
       if (!byDriver[r.driverKey]) byDriver[r.driverKey] = { name: r.name, driverKey: r.driverKey, records: [] };
       byDriver[r.driverKey].records.push(r);
     });
