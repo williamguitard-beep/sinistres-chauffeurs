@@ -1029,7 +1029,7 @@ document.addEventListener("DOMContentLoaded", function () {
     // William, 2026-09-03 : "Driver ID" (colonne unique melangeant les 2
     // systemes d'ID) remplacee par "Flott ID" (ancienne appli) / "TOM ID"
     // (nouvelle appli) — un seul des deux est jamais rempli par ligne.
-    var driverKey = pick(row, ["driverKey", "driver_key"]) || (name ? normalizeDriverName(name) : pick(row, ["driverId", "Flott ID", "TOM ID", "Driver ID", "ID"]));
+    var driverKey = pick(row, ["driverKey", "driver_key"]) || name || pick(row, ["driverId", "Flott ID", "TOM ID", "Driver ID", "ID"]);
     var dateReference = pick(row, ["dateReference", "Date Reference", "Helper date ref sinistre"]) || pick(row, ["dateSinistre", "Date Sinistre Date"]) || pick(row, ["dateEntree", "Date D Entree Date"]);
     if (!plaque || !dateReference) return null;
     var typeLocation = pick(row, ["typeLocation", "Type de location", "Type"]);
