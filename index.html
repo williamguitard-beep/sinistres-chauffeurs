@@ -703,6 +703,12 @@ document.addEventListener("DOMContentLoaded", function () {
   .grid-line { stroke: var(--border); stroke-width: 1; }
   .line-rate { fill: none; stroke: var(--risk); stroke-width: 2; }
   .dot-rate { fill: var(--risk); }
+  /* Barre proportionnelle en fond de cellule (repartition par formateur) :
+     l'oeil compare des longueurs bien plus vite que des nombres. */
+  .bar-inline {
+    display: inline-block; height: 0.7em; min-width: 2px; margin-right: 0.5em;
+    background: var(--accent); opacity: 0.45; border-radius: 2px; vertical-align: baseline;
+  }
   .bar-clickable { cursor: pointer; }
   .bar-clickable:hover .bar-dto, .bar-clickable:hover .bar-loc { opacity: 0.75; }
   .bar-clickable:hover .dot-rate { r: 5; }
@@ -1057,6 +1063,10 @@ document.addEventListener("DOMContentLoaded", function () {
       // OK ou ORPHELIN (aucun chauffeur identifie au moment du sinistre) —
       // William, 2026-09-02, pour suggestDriversForOrphelins.
       matchMethod: pick(row, ["matchMethod", "match_method"]),
+      // William, 2026-09-09 : formateur du chauffeur, issu du classeur de
+      // recrutement PITLANE. Pseudonymise sur la page publique (un formateur
+      // est un salarie nomme), en clair dans l'artefact qui lit le master.
+      formateur: pick(row, ["formateur", "Formateur"]),
       trancheSeniorite: deriveSeniority(row, String(dateReference).slice(0, 10)),
       // Conserve la date brute (pas juste la tranche calculee au moment du
       // sinistre) pour pouvoir prendre le minimum sur tous les
@@ -1859,7 +1869,81 @@ document.addEventListener("DOMContentLoaded", function () {
       stackedBarChartGeneric(locRangShareData, RANG_SERIES, {
         title: "Évolution des récidives — Location (nombre)",
         note: "Même donnée que ci-dessus (part relative), en nombre brut."
-      });
+      }) +
+      formateurCard(filtered);
+  }
+
+  /* ---- Répartition des sinistres par formateur ----
+     William, 2026-09-09 : "on doit pouvoir répartir le nombre d'accident par
+     formateur." La donnée vient du classeur de recrutement PITLANE, via la
+     colonne Formateur du master.
+
+     La carte se MASQUE tant qu'aucun sinistre ne porte de formateur : au
+     2026-09-09, la synchronisation PITLANE -> classeur n'exporte pas encore
+     cette colonne, et afficher un graphique vide laisserait croire à une
+     absence d'accidents plutôt qu'à une absence de donnée. */
+  function formateurCard(filtered) {
+    var byFormateur = {};
+    var sansFormateur = 0;
+    filtered.forEach(function (r) {
+      if (!r.formateur) { sansFormateur++; return; }
+      if (!byFormateur[r.formateur]) byFormateur[r.formateur] = { sinistres: 0, drivers: {}, recidives: 0 };
+      var f = byFormateur[r.formateur];
+      f.sinistres++;
+      if (r.driverKey) f.drivers[r.driverKey] = true;
+      if (r.rangSinistreDriver > 1) f.recidives++;
+    });
+    var noms = Object.keys(byFormateur);
+    if (noms.length === 0) return "";
+
+    var rows = noms.map(function (nom) {
+      var f = byFormateur[nom];
+      var nbDrivers = Object.keys(f.drivers).length;
+      return {
+        nom: nom,
+        sinistres: f.sinistres,
+        drivers: nbDrivers,
+        // Le vrai signal : un formateur qui a forme beaucoup de chauffeurs
+        // aura mecaniquement plus de sinistres. Rapporter au nombre de
+        // chauffeurs rend les formateurs comparables entre eux.
+        parDriver: nbDrivers ? f.sinistres / nbDrivers : 0,
+        recidives: f.recidives
+      };
+    }).sort(function (a, b) { return b.sinistres - a.sinistres; });
+
+    var maxSin = rows[0].sinistres || 1;
+    var couverts = filtered.length - sansFormateur;
+    var pct = filtered.length ? Math.round(100 * couverts / filtered.length) : 0;
+
+    var body = rows.map(function (r) {
+      var largeur = Math.round(100 * r.sinistres / maxSin);
+      return "<tr>" +
+        "<td>" + esc(r.nom) + "</td>" +
+        "<td class=\"tabular\">" +
+          "<span class=\"bar-inline\" style=\"width:" + largeur + "%\"></span> " + r.sinistres +
+        "</td>" +
+        "<td class=\"tabular\">" + r.drivers + "</td>" +
+        "<td class=\"tabular\">" + r.parDriver.toFixed(2) + "</td>" +
+        "<td class=\"tabular\">" + r.recidives + "</td>" +
+      "</tr>";
+    }).join("");
+
+    return "<div class=\"card\">" +
+      "<h3>Répartition des sinistres par formateur</h3>" +
+      "<p class=\"note\">Formateur issu du classeur de recrutement. " +
+        "<strong>" + couverts + "</strong> des " + filtered.length + " sinistres de la sélection " +
+        "(" + pct + "&nbsp;%) portent un formateur connu&nbsp;; " +
+        (sansFormateur === 1 ? "le dernier concerne un chauffeur absent"
+          : "les " + sansFormateur + " autres concernent des chauffeurs absents") +
+        " du classeur ou enregistré" + (sansFormateur === 1 ? "" : "s") +
+        " avant que la colonne existe. " +
+        "Comparez les formateurs sur «&nbsp;par chauffeur&nbsp;» plutôt que sur le total&nbsp;: " +
+        "un formateur qui a formé plus de monde aura mécaniquement plus de sinistres.</p>" +
+      "<table><thead><tr>" +
+        "<th>Formateur</th><th>Sinistres</th><th>Chauffeurs</th>" +
+        "<th>Par chauffeur</th><th>Dont récidives</th>" +
+      "</tr></thead><tbody>" + body + "</tbody></table>" +
+    "</div>";
   }
 
   /* ---- Tab: Recrutement (score de test vs accidentalité) ---- */
