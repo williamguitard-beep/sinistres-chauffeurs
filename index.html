@@ -10,7 +10,7 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Sinistres Chauffeurs</title>
 <style>:root{color-scheme:light}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#faf9f5;color:#141413}img{max-width:100%}[hidden]:not([hidden=until-found]){display:none!important}</style>
-<style>#tab-drivers, #tab-vehicles, #tab-unmatched, #tab-declarations, #tab-rapprochements { display: none !important; }</style>
+<style>#tab-drivers, #tab-vehicles, #tab-unmatched, #tab-declarations, #tab-rapprochements, #tab-notes { display: none !important; }</style>
 <script src="config.js"></script>
 <script>
 /* ==========================================================================
@@ -705,6 +705,9 @@ document.addEventListener("DOMContentLoaded", function () {
   .dot-rate { fill: var(--risk); }
   /* Barre proportionnelle en fond de cellule (repartition par formateur) :
      l'oeil compare des longueurs bien plus vite que des nombres. */
+  /* Note d'avertissement : une couverture trop faible doit se voir avant le
+     tableau, sinon on lit des ecarts qui ne mesurent rien. */
+  .warn-note { border-left: 3px solid var(--warn); padding-left: 0.75em; }
   .bar-inline {
     display: inline-block; height: 0.7em; min-width: 2px; margin-right: 0.5em;
     background: var(--accent); opacity: 0.45; border-radius: 2px; vertical-align: baseline;
@@ -798,6 +801,7 @@ document.addEventListener("DOMContentLoaded", function () {
     <button class="tab" id="tab-unmatched" role="tab" aria-selected="false">Non rattachés</button>
     <button class="tab" id="tab-declarations" role="tab" aria-selected="false">Déclarations</button>
     <button class="tab" id="tab-rapprochements" role="tab" aria-selected="false">Rapprochements</button>
+    <button class="tab" id="tab-notes" role="tab" aria-selected="false">Notes &amp; Formation</button>
   </nav>
 
   <section class="panel" id="panel-drivers"></section>
@@ -806,6 +810,7 @@ document.addEventListener("DOMContentLoaded", function () {
   <section class="panel" id="panel-unmatched"></section>
   <section class="panel" id="panel-declarations"></section>
   <section class="panel" id="panel-rapprochements"></section>
+  <section class="panel" id="panel-notes"></section>
 
   <footer class="foot">Séniorité, périodes et statuts calculés côté client à partir de <span class="tabular">Immobilisations_v05/2026</span> — le Sheet reste la seule source de vérité.</footer>
 </div>
@@ -863,6 +868,18 @@ document.addEventListener("DOMContentLoaded", function () {
     // chauffeurs"), rapproche par nom normalise — alimente la vue
     // "Recrutement" (correlation note vs accidentalite).
     recruitment: { byKey: {}, dataMode: "demo" },
+    // William, 2026-09-09 : formateur par chauffeur, lu DIRECTEMENT depuis le
+    // classeur de recrutement, sans passer par le master ni par une
+    // modification de la synchronisation PITLANE.
+    formateurs: { byKey: {}, dataMode: "absent", sourceTab: null },
+    // William, 2026-09-10 : notes du test de conduite (score/verdict/statut
+    // formation) + moniteur/formateur d'accompagnement, lus DIRECTEMENT
+    // depuis le CSV "sinistres_notes_72.csv" (extrait du classeur
+    // "Monitoring : Sinistralité des Chauffeurs"). Rapprochement par
+    // téléphone (clé la plus fiable — matchBy=phone dans 60 % du CSV),
+    // fallback par cle chauffeur normalisee. Alimente l'onglet
+    // "Notes & Formation".
+    notes: { byPhone: {}, byKey: {}, dataMode: "absent", error: null, count: 0 },
     // William, 2026-09-03 : quel champ la recherche libre de "Non
     // rattachés" compare — "name" (defaut) | "phone" | "permit" | "birthDate".
     unmatchedSearchMode: "name",
@@ -1151,6 +1168,22 @@ document.addEventListener("DOMContentLoaded", function () {
     return !!driverKey && !NON_DRIVER_KEYS[String(driverKey).toLowerCase()];
   }
 
+  /* Attache le formateur a chaque sinistre, par cle chauffeur.
+     La valeur portee par l'enregistrement (colonne Formateur du master)
+     l'emporte quand elle existe ; sinon on prend celle lue en direct dans le
+     classeur de recrutement. Les deux chemins coexistent volontairement :
+     le master n'aura la colonne que si la synchronisation PITLANE l'exporte
+     un jour, la lecture directe marche des maintenant. */
+  function withFormateurs(records) {
+    var byKey = (state.formateurs && state.formateurs.byKey) || {};
+    if (Object.keys(byKey).length === 0) return records;
+    return records.map(function (r) {
+      if (r.formateur) return r;
+      var f = r.driverKey ? byKey[r.driverKey] : null;
+      return f ? Object.assign({}, r, { formateur: f }) : r;
+    });
+  }
+
   function withCounters(records) {
     var byVeh = {}, byDrv = {};
     records.forEach(function (r) {
@@ -1231,7 +1264,7 @@ document.addEventListener("DOMContentLoaded", function () {
      ========================================================= */
   function render() {
     renderBanner();
-    var filtered = withCounters(applyFilters(state.records));
+    var filtered = withCounters(applyFilters(withNotes(withFormateurs(state.records))));
     // William, 2026-09-05 : la delegation d'evenements est cablee UNE FOIS
     // par panel (wireConfirmButtons) et n'a donc pas acces au `filtered` du
     // rendu courant — la recherche libre de sinistres en a besoin.
@@ -1244,6 +1277,7 @@ document.addEventListener("DOMContentLoaded", function () {
     if (state.tab === "unmatched") renderUnmatched(filtered);
     if (state.tab === "declarations") renderDeclarations(filtered);
     if (state.tab === "rapprochements") renderRapprochements();
+    if (state.tab === "notes") renderNotesFormation(filtered);
   }
 
   function renderBanner() {
@@ -1882,6 +1916,27 @@ document.addEventListener("DOMContentLoaded", function () {
      2026-09-09, la synchronisation PITLANE -> classeur n'exporte pas encore
      cette colonne, et afficher un graphique vide laisserait croire à une
      absence d'accidents plutôt qu'à une absence de donnée. */
+  /* Aucun formateur rattaché : on ne montre rien, SAUF quand la lecture du
+     classeur de recrutement a échoué pour une raison que William peut
+     corriger. Un connecteur à reconnecter et un connecteur absent
+     n'appellent pas la même action. */
+  var FORMATEUR_ERROR_HELP = {
+    needs_reauth: "La connexion à Google Drive a expiré — reconnectez le connecteur dans vos paramètres claude.ai.",
+    server_not_connected: "Le connecteur Google Drive n'est pas ajouté à ce compte — ajoutez-le dans vos paramètres claude.ai.",
+    blocked_by_policy: "L'accès au classeur de recrutement est bloqué par une règle d'organisation.",
+    approval_required: "L'accès au classeur de recrutement attend une approbation."
+  };
+
+  function formateurUnavailableCard() {
+    var code = state.formateurs && state.formateurs.error;
+    var help = code && FORMATEUR_ERROR_HELP[code];
+    if (!help) return "";
+    return "<div class=\"card\">" +
+      "<h3>Répartition des sinistres par formateur</h3>" +
+      "<p class=\"note warn-note\">" + esc(help) + "</p>" +
+    "</div>";
+  }
+
   function formateurCard(filtered) {
     var byFormateur = {};
     var sansFormateur = 0;
@@ -1894,7 +1949,7 @@ document.addEventListener("DOMContentLoaded", function () {
       if (r.rangSinistreDriver > 1) f.recidives++;
     });
     var noms = Object.keys(byFormateur);
-    if (noms.length === 0) return "";
+    if (noms.length === 0) return formateurUnavailableCard();
 
     var rows = noms.map(function (nom) {
       var f = byFormateur[nom];
@@ -1930,20 +1985,383 @@ document.addEventListener("DOMContentLoaded", function () {
 
     return "<div class=\"card\">" +
       "<h3>Répartition des sinistres par formateur</h3>" +
-      "<p class=\"note\">Formateur issu du classeur de recrutement. " +
-        "<strong>" + couverts + "</strong> des " + filtered.length + " sinistres de la sélection " +
-        "(" + pct + "&nbsp;%) portent un formateur connu&nbsp;; " +
-        (sansFormateur === 1 ? "le dernier concerne un chauffeur absent"
-          : "les " + sansFormateur + " autres concernent des chauffeurs absents") +
-        " du classeur ou enregistré" + (sansFormateur === 1 ? "" : "s") +
-        " avant que la colonne existe. " +
-        "Comparez les formateurs sur «&nbsp;par chauffeur&nbsp;» plutôt que sur le total&nbsp;: " +
-        "un formateur qui a formé plus de monde aura mécaniquement plus de sinistres.</p>" +
+      (pct < 20
+        ? "<p class=\"note warn-note\"><strong>Couverture trop faible pour conclure.</strong> " +
+          "Seuls <strong>" + couverts + "</strong> des " + filtered.length + " sinistres de la sélection " +
+          "(" + pct + "&nbsp;%) portent un formateur connu. Le classeur de recrutement ne rattache " +
+          "aujourd'hui un formateur qu'aux chauffeurs passés par la grille de test de conduite, " +
+          "et presque aucun d'eux n'a de sinistre. Les écarts ci-dessous ne mesurent donc rien " +
+          "d'exploitable&nbsp;: ils décrivent qui a été évalué, pas qui a formé des conducteurs " +
+          "accidentogènes. Pour que ce tableau devienne lisible, la colonne Formateur de PITLANE " +
+          "doit être exportée pour tous les chauffeurs enregistrés.</p>"
+        : "<p class=\"note\">Formateur issu du classeur de recrutement, lu en direct. " +
+          "<strong>" + couverts + "</strong> des " + filtered.length + " sinistres de la sélection " +
+          "(" + pct + "&nbsp;%) portent un formateur connu&nbsp;; " +
+          (sansFormateur === 1 ? "le dernier concerne un chauffeur absent du classeur"
+            : "les " + sansFormateur + " autres concernent des chauffeurs absents du classeur") + ". " +
+          "Comparez les formateurs sur «&nbsp;par chauffeur&nbsp;» plutôt que sur le total&nbsp;: " +
+          "un formateur qui a formé plus de monde aura mécaniquement plus de sinistres.</p>") +
       "<table><thead><tr>" +
         "<th>Formateur</th><th>Sinistres</th><th>Chauffeurs</th>" +
         "<th>Par chauffeur</th><th>Dont récidives</th>" +
       "</tr></thead><tbody>" + body + "</tbody></table>" +
     "</div>";
+  }
+
+  /* =========================================================
+     Notes de test de conduite + statut formation
+     ---------------------------------------------------------
+     Source : "sinistres_notes_72.csv" (Drive standalone, extrait du
+     classeur "Monitoring : Sinistralité des Chauffeurs"). 72 chauffeurs
+     accidentés recroisés avec le suivi formation. Colonnes utilisées :
+       phone / fsName          — clés de rapprochement
+       score, verdict          — note du test (souvent vide : ~14/72 seulement)
+       statut                  — étape de formation (test_echoue, assigne, ...)
+       moniteurSaisi           — moniteur qui a saisi la fiche (rempli le plus souvent)
+       formateurFiche          — formateur sur fiche (rarement rempli)
+     ========================================================= */
+
+  // MCP renvoie le CSV comme texte brut avec échappements markdown-like
+  // (\_ pour _). On les enlève avant tout parsing — sinon "test\_echoue"
+  // ne matchera jamais "test_echoue" côté agrégation.
+  function unescapeMarkdown(s) {
+    return s == null ? "" : String(s).replace(/\\([_*])/g, "$1");
+  }
+
+  // Chiffres uniquement — le CSV mélange formats (2250153100835, sans
+  // indicatif, avec espaces...). On garde la sous-chaîne la plus longue
+  // de chiffres consécutifs, cohérente avec searchByPhone dans "Non
+  // rattachés" (mode "phone") qui compare aussi sur sous-chaîne de chiffres.
+  function phoneDigits(raw) {
+    if (!raw) return "";
+    var digits = String(raw).replace(/\D+/g, "");
+    return digits.length >= 8 ? digits.slice(-10) : digits;
+  }
+
+  // Parse le CSV notes en tableau d'objets. Utilise parseCsvBlock qui
+  // gère déjà l'absence de fence markdown, puis unescape les valeurs.
+  function parseNotesCSV(text) {
+    var rows = parseCsvBlock(String(text));
+    return rows.map(function (row) {
+      var out = {};
+      Object.keys(row).forEach(function (k) {
+        out[k.trim()] = unescapeMarkdown(row[k]).trim();
+      });
+      return out;
+    });
+  }
+
+  // Construit deux index :
+  //   byPhone : clé la plus fiable (matchBy=phone dans 60 % du CSV)
+  //   byKey   : nom normalisé (même normalizeDriverName que le master),
+  //             fallback pour les 40 % restants (matchBy=name)
+  function buildNotesIndex(rows) {
+    var byPhone = {}, byKey = {}, count = 0;
+    rows.forEach(function (row) {
+      if (!row.fsName && !row.csvName) return;
+      var scoreRaw = row.score;
+      var entry = {
+        fsName: row.fsName || row.csvName,
+        statutFormation: row.statut || null,   // test_echoue|assigne|nouveau|recontacter|attente_vehicule
+        note: scoreRaw !== "" && scoreRaw != null ? Number(scoreRaw) : null,
+        verdict: row.verdict || null,          // elimine|valide|""
+        formationDate: row.formationDate || null,
+        // "moniteurSaisi" est rempli le plus souvent ; formateurFiche
+        // sinon. Priorité au premier non vide — même logique que pick().
+        moniteur: row.moniteurSaisi || row.formateurFiche || row.moniteurTest || null,
+        nbSinCSV: row.nbSin ? Number(row.nbSin) : null
+      };
+      var phone = phoneDigits(row.phone);
+      if (phone) byPhone[phone] = entry;
+      var key = normalizeDriverName(row.fsName || row.csvName);
+      if (key) byKey[key] = entry;
+      count++;
+    });
+    return { byPhone: byPhone, byKey: byKey, count: count };
+  }
+
+  function fetchNotesLive() {
+    (async function () {
+      try {
+        var mcp = await window.claude.use("mcp");
+        if (!mcp) return;
+        var result = await mcp.callTool("Google Drive", "read_file_content", {
+          fileId: NOTES_FILE_ID
+        }, { cache: { refresh: true } });
+        var payload = result && result.payload;
+        var text = payload && (payload.fileContent || payload.content || payload.text);
+        if (!text) { state.notes.dataMode = "absent"; return; }
+        var idx = buildNotesIndex(parseNotesCSV(text));
+        state.notes = {
+          byPhone: idx.byPhone,
+          byKey: idx.byKey,
+          count: idx.count,
+          dataMode: idx.count > 0 ? "live" : "absent",
+          error: null
+        };
+      } catch (err) {
+        // Même contrat que fetchFormateursLive : distinguer les codes
+        // d'erreur MCP pour que la carte "unavailable" oriente l'action.
+        state.notes = { byPhone: {}, byKey: {}, count: 0, dataMode: "absent",
+          error: (err && err.code) || null };
+      } finally {
+        if (state.tab === "notes") render();
+      }
+    })();
+  }
+
+  /* Attache les données de note à chaque sinistre.
+     Priorité au téléphone (matchBy=phone dans 60 % du CSV), fallback sur
+     la clé chauffeur normalisée. Retourne les records enrichis avec
+     { note, statutFormation, verdict, moniteurFormation, formationDate }. */
+  function withNotes(records) {
+    var byPhone = state.notes.byPhone || {};
+    var byKey = state.notes.byKey || {};
+    if (Object.keys(byPhone).length === 0 && Object.keys(byKey).length === 0) return records;
+    return records.map(function (r) {
+      var entry = null;
+      var phone = phoneDigits(r.phone);
+      if (phone && byPhone[phone]) entry = byPhone[phone];
+      else if (r.driverKey && byKey[r.driverKey]) entry = byKey[r.driverKey];
+      if (!entry) return r;
+      return Object.assign({}, r, {
+        note: entry.note,
+        statutFormation: entry.statutFormation,
+        verdict: entry.verdict,
+        moniteurFormation: entry.moniteur,
+        formationDate: entry.formationDate
+      });
+    });
+  }
+
+  /* ---- Onglet Notes & Formation ----
+     Deux cartes :
+       1. Note du test × sinistres — les rares scores connus ventilés par
+          tranche, avec la sinistralité observée. n petit → présenté comme
+          exploratoire, jamais comme une conclusion statistique.
+       2. Formateur × verdict × sinistres — croisement du moniteur avec le
+          verdict et la sinistralité, pour identifier des écarts par
+          formateur au-delà du seul volume déjà montré dans la carte
+          "Répartition par formateur". */
+
+  var NOTES_ERROR_HELP = {
+    needs_reauth: "La connexion à Google Drive a expiré — reconnectez le connecteur dans vos paramètres claude.ai.",
+    server_not_connected: "Le connecteur Google Drive n'est pas ajouté à ce compte — ajoutez-le dans vos paramètres claude.ai.",
+    blocked_by_policy: "L'accès au CSV des notes est bloqué par une règle d'organisation.",
+    approval_required: "L'accès au CSV des notes attend une approbation.",
+    config_missing: "Les notes ne sont pas exposées à la page publique. Ouvrez l'artefact privé pour visualiser cette corrélation."
+  };
+
+  function notesUnavailableCard() {
+    var code = state.notes && state.notes.error;
+    var help = code && NOTES_ERROR_HELP[code];
+    var msg = help || "Aucune note rapprochée pour la sélection en cours.";
+    return "<div class=\"card\">" +
+      "<h3>Notes du test de conduite × sinistres</h3>" +
+      "<p class=\"note warn-note\">" + esc(msg) + "</p>" +
+    "</div>";
+  }
+
+  /* Card 1 : score × sinistres.
+     n reste petit (~14 sur 72 CSV, dont un sous-ensemble croise la
+     sélection filtrée). On agrège par tranche de score plutôt que par
+     scatter individuel : ça masque moins bien les tendances quand n est
+     faible, et évite d'exposer des noms sur un scatter. */
+  function noteVsSinistresCard(filtered) {
+    // Un chauffeur peut avoir plusieurs lignes filtrées (plusieurs
+    // sinistres) — on agrège au niveau chauffeur, pas au niveau ligne,
+    // sinon un chauffeur récidiviste compterait plusieurs fois sa note.
+    var byDriver = {};
+    filtered.forEach(function (r) {
+      if (r.note == null || !isFinite(r.note)) return;
+      if (!byDriver[r.driverKey]) byDriver[r.driverKey] = { note: r.note, sinistres: 0, verdict: r.verdict };
+      byDriver[r.driverKey].sinistres++;
+    });
+    var drivers = Object.keys(byDriver).map(function (k) { return byDriver[k]; });
+    if (drivers.length === 0) return notesUnavailableCard();
+
+    var buckets = [
+      { label: "0-15 (échec probable)", min: 0, max: 15.0001 },
+      { label: "16-20 (limite)",        min: 15.0001, max: 20.0001 },
+      { label: "21+ (validé)",          min: 20.0001, max: 999 }
+    ];
+    var agg = buckets.map(function (b) {
+      var inb = drivers.filter(function (d) { return d.note >= b.min && d.note < b.max; });
+      var totalSin = inb.reduce(function (s, d) { return s + d.sinistres; }, 0);
+      return {
+        label: b.label,
+        n: inb.length,
+        sinistres: totalSin,
+        moyenne: inb.length ? totalSin / inb.length : 0
+      };
+    });
+    var maxMoy = Math.max.apply(null, agg.map(function (a) { return a.moyenne; })) || 1;
+
+    var body = agg.map(function (a) {
+      var largeur = Math.round(100 * a.moyenne / maxMoy);
+      return "<tr>" +
+        "<td>" + esc(a.label) + "</td>" +
+        "<td class=\"tabular\">" + a.n + "</td>" +
+        "<td class=\"tabular\">" + a.sinistres + "</td>" +
+        "<td class=\"tabular\">" +
+          "<span class=\"bar-inline\" style=\"width:" + largeur + "%\"></span> " +
+          a.moyenne.toFixed(2) +
+        "</td>" +
+      "</tr>";
+    }).join("");
+
+    return "<div class=\"card\">" +
+      "<h3>Notes du test de conduite × sinistres</h3>" +
+      "<p class=\"note warn-note\"><strong>Exploratoire — n=" + drivers.length + ".</strong> " +
+        "Sur les 72 chauffeurs suivis dans le CSV notes, une quinzaine seulement ont un score renseigné, " +
+        "et tous n'apparaissent pas dans la sélection filtrée. Une tranche montrant plus de sinistres par chauffeur " +
+        "qu'une autre est une <em>piste</em>, pas une preuve — comparez sur \"sinistres par chauffeur\" et non sur le total.</p>" +
+      "<table><thead><tr>" +
+        "<th>Tranche de score</th><th>Chauffeurs</th><th>Sinistres</th><th>Par chauffeur</th>" +
+      "</tr></thead><tbody>" + body + "</tbody></table>" +
+    "</div>";
+  }
+
+  /* Card 2 : formateur (moniteur d'accompagnement) × verdict × sinistres.
+     Complète la carte "Répartition par formateur" qui utilise la colonne
+     Formateur du master (recrutement PITLANE) — ici on utilise
+     moniteurSaisi/formateurFiche du CSV notes, un champ différent (le
+     formateur qui a saisi la fiche de test), rempli plus largement. */
+  function formateurNotesCard(filtered) {
+    var byMoniteur = {};
+    filtered.forEach(function (r) {
+      if (!r.moniteurFormation) return;
+      var m = r.moniteurFormation;
+      if (!byMoniteur[m]) byMoniteur[m] = { drivers: {}, sinistres: 0, scoreSum: 0, scoreN: 0, elimines: {}, valides: {} };
+      var b = byMoniteur[m];
+      b.sinistres++;
+      if (r.driverKey) {
+        b.drivers[r.driverKey] = true;
+        if (r.verdict === "elimine") b.elimines[r.driverKey] = true;
+        if (r.verdict === "valide") b.valides[r.driverKey] = true;
+      }
+    });
+    // Note moyenne par formateur, comptée UNE FOIS par chauffeur (pas par sinistre).
+    Object.keys(byMoniteur).forEach(function (m) {
+      var seen = {};
+      filtered.forEach(function (r) {
+        if (r.moniteurFormation !== m || !r.driverKey || seen[r.driverKey]) return;
+        seen[r.driverKey] = true;
+        if (r.note != null && isFinite(r.note)) {
+          byMoniteur[m].scoreSum += r.note;
+          byMoniteur[m].scoreN++;
+        }
+      });
+    });
+    var noms = Object.keys(byMoniteur);
+    if (noms.length === 0) {
+      var code = state.notes && state.notes.error;
+      var help = code && NOTES_ERROR_HELP[code];
+      if (help) {
+        return "<div class=\"card\">" +
+          "<h3>Formateur × verdict × sinistres</h3>" +
+          "<p class=\"note warn-note\">" + esc(help) + "</p>" +
+        "</div>";
+      }
+      return "";
+    }
+
+    var rows = noms.map(function (nom) {
+      var b = byMoniteur[nom];
+      var nbDrivers = Object.keys(b.drivers).length;
+      return {
+        nom: nom,
+        drivers: nbDrivers,
+        sinistres: b.sinistres,
+        parDriver: nbDrivers ? b.sinistres / nbDrivers : 0,
+        elimines: Object.keys(b.elimines).length,
+        valides: Object.keys(b.valides).length,
+        noteMoy: b.scoreN ? b.scoreSum / b.scoreN : null
+      };
+    }).sort(function (a, b) { return b.sinistres - a.sinistres; });
+
+    var maxSin = rows[0].sinistres || 1;
+    var body = rows.map(function (r) {
+      var largeur = Math.round(100 * r.sinistres / maxSin);
+      return "<tr>" +
+        "<td>" + esc(r.nom) + "</td>" +
+        "<td class=\"tabular\">" + r.drivers + "</td>" +
+        "<td class=\"tabular\">" +
+          "<span class=\"bar-inline\" style=\"width:" + largeur + "%\"></span> " + r.sinistres +
+        "</td>" +
+        "<td class=\"tabular\">" + r.parDriver.toFixed(2) + "</td>" +
+        "<td class=\"tabular\">" + r.elimines + " / " + r.valides + "</td>" +
+        "<td class=\"tabular\">" + (r.noteMoy != null ? r.noteMoy.toFixed(1) : "—") + "</td>" +
+      "</tr>";
+    }).join("");
+
+    return "<div class=\"card\">" +
+      "<h3>Formateur (moniteur d'accompagnement) × verdict × sinistres</h3>" +
+      "<p class=\"note\">Moniteur pris dans le CSV notes (colonne <em>moniteurSaisi</em>, à défaut <em>formateurFiche</em> ou <em>moniteurTest</em>). " +
+        "Un moniteur qui a suivi plus de chauffeurs aura mécaniquement plus de sinistres — comparez sur \"par chauffeur\" " +
+        "et sur le ratio éliminés/validés plutôt que sur le total brut.</p>" +
+      "<table><thead><tr>" +
+        "<th>Moniteur</th><th>Chauffeurs</th><th>Sinistres</th>" +
+        "<th>Par chauffeur</th><th>Éliminés / Validés</th><th>Note moy.</th>" +
+      "</tr></thead><tbody>" + body + "</tbody></table>" +
+    "</div>";
+  }
+
+  /* Card 3 : statut de formation × sinistres.
+     "assigne" veut dire "en poste", "test_echoue" un chauffeur qui devait
+     l'être et ne l'est plus, etc. Voir si un statut particulier concentre
+     la sinistralité (attente_vehicule ne devrait presque pas apparaître, par ex.). */
+  function statutFormationCard(filtered) {
+    var byStatut = {};
+    filtered.forEach(function (r) {
+      if (!r.statutFormation) return;
+      var s = r.statutFormation;
+      if (!byStatut[s]) byStatut[s] = { drivers: {}, sinistres: 0 };
+      byStatut[s].sinistres++;
+      if (r.driverKey) byStatut[s].drivers[r.driverKey] = true;
+    });
+    var stats = Object.keys(byStatut).map(function (s) {
+      var b = byStatut[s];
+      var n = Object.keys(b.drivers).length;
+      return { statut: s, drivers: n, sinistres: b.sinistres, parDriver: n ? b.sinistres / n : 0 };
+    }).sort(function (a, b) { return b.sinistres - a.sinistres; });
+    if (stats.length === 0) return "";
+    var maxSin = stats[0].sinistres || 1;
+    var body = stats.map(function (r) {
+      var largeur = Math.round(100 * r.sinistres / maxSin);
+      return "<tr>" +
+        "<td>" + esc(r.statut) + "</td>" +
+        "<td class=\"tabular\">" + r.drivers + "</td>" +
+        "<td class=\"tabular\">" +
+          "<span class=\"bar-inline\" style=\"width:" + largeur + "%\"></span> " + r.sinistres +
+        "</td>" +
+        "<td class=\"tabular\">" + r.parDriver.toFixed(2) + "</td>" +
+      "</tr>";
+    }).join("");
+    return "<div class=\"card\">" +
+      "<h3>Statut de formation × sinistres</h3>" +
+      "<p class=\"note\">Répartition des sinistres selon l'étape de suivi formation du chauffeur, telle qu'enregistrée " +
+        "dans le CSV notes au jour de l'extraction.</p>" +
+      "<table><thead><tr>" +
+        "<th>Statut</th><th>Chauffeurs</th><th>Sinistres</th><th>Par chauffeur</th>" +
+      "</tr></thead><tbody>" + body + "</tbody></table>" +
+    "</div>";
+  }
+
+  function renderNotesFormation(filtered) {
+    var panel = document.getElementById("panel-notes");
+    var couverts = filtered.filter(function (r) { return r.statutFormation != null; }).length;
+    var header = "<div class=\"card\">" +
+      "<h3>Notes &amp; Formation</h3>" +
+      "<p class=\"note\">Rapprochement du CSV <em>sinistres_notes_72.csv</em> (72 chauffeurs suivis) avec les sinistres " +
+        "du master. Clé de rapprochement&nbsp;: téléphone (le plus fiable), fallback nom normalisé. " +
+        "<strong>" + couverts + "</strong> sinistre" + (couverts > 1 ? "s" : "") + " de la sélection actuelle " +
+        "porte" + (couverts > 1 ? "nt" : "") + " une note ou un statut formation rapproché.</p>" +
+    "</div>";
+    panel.innerHTML = header +
+      noteVsSinistresCard(filtered) +
+      formateurNotesCard(filtered) +
+      statutFormationCard(filtered);
   }
 
   /* ---- Tab: Recrutement (score de test vs accidentalité) ---- */
@@ -2694,6 +3112,12 @@ document.addEventListener("DOMContentLoaded", function () {
   // position (gid=0) le 2026-09-03 — meme contrainte export CSV que les
   // deux classeurs ci-dessus (voir fetchLive).
   var DECLARATIONS_SPREADSHEET_ID = '1bUscyVCQF7hKIPNUZ5YWMsfEWzJXakWhQSd-uMcUBtI';
+  // Extract du classeur "Monitoring : Sinistralité des Chauffeurs" — tenu
+  // par William, 72 chauffeurs avec statut formation, score/verdict au test
+  // de conduite, et moniteur d'accompagnement. Fichier CSV Drive standalone
+  // (pas un onglet publié) : lu via read_file_content, jamais publié en
+  // clair car nominatif (noms + téléphones). William, 2026-09-10.
+  var NOTES_FILE_ID = '1zLQ0vjhr9PU3iIMaZWobP2i_MR-q6n5M';
 
   // Locates the heading + fenced code block for one specific tab inside a
   // multi-tab contentSnippet, instead of blindly taking the first ``` block
@@ -3559,6 +3983,137 @@ document.addEventListener("DOMContentLoaded", function () {
     state.recruitment = { byKey: buildRecruitmentIndex(DEMO_RECRUITMENT), dataMode: "demo" };
   }
 
+  /* ---- Formateurs : lecture DIRECTE du classeur de recrutement ----
+     William, 2026-09-09 : "fais le branchement directement dans l'artéfact
+     sans que j'aie besoin de passer par sheet."
+
+     POURQUOI UN AUTRE OUTIL QUE LE RESTE. download_file_content exporte un
+     classeur Google en CSV, et un CSV n'a qu'une feuille : il rend toujours
+     le PREMIER onglet, jamais un onglet visé par son nom. Or la colonne du
+     formateur n'est pas sur le premier onglet — vérifié le 2026-09-09, ses
+     4833 lignes et 26 colonnes ne contiennent pas une seule fois "Aballet".
+     read_file_content, lui, rend TOUT le classeur sous forme de tableaux
+     markdown, onglet par onglet. C'est le seul chemin qui atteint les autres
+     onglets sans rien changer côté sheet.
+
+     LIMITE CONNUE : ce rendu est tronqué pour un gros classeur (195 Ko lus
+     sur 1,3 Mo le 2026-09-09). La table des moniteurs y était complète, mais
+     une table située plus loin pourrait être coupée. */
+  function parseMarkdownTables(text) {
+    var tables = [];
+    var current = null;
+    (text || "").split(/\r?\n/).forEach(function (line) {
+      var l = line.trim();
+      if (l.indexOf("|") !== 0) { if (current) { tables.push(current); current = null; } return; }
+      var cells = l.split("|").slice(1, -1).map(function (c) { return c.trim(); });
+      // Ligne de séparation d'un tableau markdown (| :-: | :-: |) : ignorée.
+      if (cells.every(function (c) { return /^:?-+:?$/.test(c); })) return;
+      if (!current) current = { lines: [] };
+      current.lines.push(cells);
+    });
+    if (current) tables.push(current);
+    // On ne décide PAS ici quelle ligne est l'en-tête : ce rendu place la
+    // ligne de séparation AVANT les vrais en-têtes, précédée d'une ligne
+    // entièrement vide. Prendre la première ligne venue faisait passer cette
+    // ligne vide pour l'en-tête et perdait la table entière (vérifié sur le
+    // rendu réel du 2026-09-09 : 24 tableaux, 0 formateur trouvé).
+    return tables;
+  }
+
+  function normHeader(h) {
+    return String(h || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  }
+
+  /* Repère, dans un tableau, la colonne du formateur et celle du chauffeur.
+     On cherche par CONTENU du libellé plutôt que par égalité : l'un des
+     en-têtes réels fait 130 caractères ("Nom et Prénom du chauffeur (comme
+     inscrit sur permis EN MAJUSCULE OBLIGATOIREMENT)"), et on ne contrôle
+     aucune des deux sources. */
+  function locateFormateurColumns(headers) {
+    var norm = headers.map(normHeader);
+    var trainer = -1, driver = -1;
+    norm.forEach(function (h, i) {
+      if (trainer === -1 && (h.indexOf("formateur") !== -1 || h.indexOf("moniteur") !== -1)) trainer = i;
+    });
+    if (trainer === -1) return null;
+    // Colonne du chauffeur : celle qui parle de nom, en excluant celle du
+    // formateur. On préfère un libellé qui mentionne explicitement le
+    // chauffeur, sinon on retombe sur le premier "nom" venu.
+    norm.forEach(function (h, i) {
+      if (i === trainer || driver !== -1) return;
+      if (h.indexOf("chauffeur") !== -1 && h.indexOf("nom") !== -1) driver = i;
+    });
+    if (driver === -1) {
+      norm.forEach(function (h, i) {
+        if (i === trainer || driver !== -1) return;
+        if (h.indexOf("nom") !== -1 || h.indexOf("prenom") !== -1) driver = i;
+      });
+    }
+    return driver === -1 ? null : { trainer: trainer, driver: driver };
+  }
+
+  var FORMATEUR_PLACEHOLDERS = { "": 1, "-": 1, "—": 1, "NULL": 1, "n/a": 1 };
+
+  function buildFormateurIndex(tables) {
+    var best = { byKey: {}, count: 0, headers: null };
+    tables.forEach(function (t) {
+      // L'en-tête peut être la 1re, 2e ou 3e ligne du bloc selon la mise en
+      // forme de l'onglet : on essaie chacune et on garde celle qui décrit
+      // effectivement un formateur.
+      var cols = null, headerIdx = -1;
+      for (var i = 0; i < Math.min(3, t.lines.length); i++) {
+        var c = locateFormateurColumns(t.lines[i]);
+        if (c) { cols = c; headerIdx = i; break; }
+      }
+      if (!cols) return;
+      var byKey = {};
+      t.lines.slice(headerIdx + 1).forEach(function (cells) {
+        var trainer = (cells[cols.trainer] || "").trim();
+        var driver = (cells[cols.driver] || "").trim();
+        if (!trainer || FORMATEUR_PLACEHOLDERS[trainer]) return;
+        var key = normalizeDriverName(driver);
+        if (!key) return;
+        byKey[key] = trainer;
+      });
+      var n = Object.keys(byKey).length;
+      // On garde l'onglet le PLUS COUVRANT, pas le premier trouvé : plusieurs
+      // onglets peuvent porter un formateur, avec des couvertures très
+      // différentes.
+      if (n > best.count) best = { byKey: byKey, count: n, headers: t.lines[headerIdx][cols.trainer] };
+    });
+    return best;
+  }
+
+  function fetchFormateursLive() {
+    (async function () {
+      try {
+        var mcp = await window.claude.use("mcp");
+        if (!mcp) return;
+        var result = await mcp.callTool("Google Drive", "read_file_content", {
+          fileId: RECRUTEMENT_SPREADSHEET_ID
+        }, { cache: { refresh: true } });
+        var payload = result && result.payload;
+        var text = payload && (payload.fileContent || payload.content || payload.text);
+        if (!text) { state.formateurs.dataMode = "absent"; return; }
+        var best = buildFormateurIndex(parseMarkdownTables(String(text)));
+        state.formateurs = {
+          byKey: best.byKey,
+          dataMode: best.count > 0 ? "live" : "absent",
+          sourceTab: best.headers
+        };
+      } catch (err) {
+        // Le contrat MCP demande de distinguer les codes : un connecteur à
+        // reconnecter et un connecteur absent n'appellent pas la même
+        // action, et les fondre dans un même silence cache la seule chose
+        // qui débloquerait la page.
+        state.formateurs = { byKey: {}, dataMode: "absent", sourceTab: null,
+          error: (err && err.code) || null };
+      } finally {
+        if (state.tab === "dtoloc") render();
+      }
+    })();
+  }
+
   function fetchRecruitmentLive() {
     (async function () {
       try {
@@ -3669,7 +4224,7 @@ document.addEventListener("DOMContentLoaded", function () {
      7. Wiring
      ========================================================= */
   function initTabs() {
-    var map = { drivers: "tab-drivers", vehicles: "tab-vehicles", dtoloc: "tab-dtoloc", unmatched: "tab-unmatched", declarations: "tab-declarations", rapprochements: "tab-rapprochements" };
+    var map = { drivers: "tab-drivers", vehicles: "tab-vehicles", dtoloc: "tab-dtoloc", unmatched: "tab-unmatched", declarations: "tab-declarations", rapprochements: "tab-rapprochements", notes: "tab-notes" };
     Object.keys(map).forEach(function (key) {
       document.getElementById(map[key]).addEventListener("click", function () {
         state.tab = key;
@@ -3702,7 +4257,9 @@ document.addEventListener("DOMContentLoaded", function () {
       if (state.refreshing) return;
       fetchLive();
       fetchRecruitmentLive();
+      fetchFormateursLive();
       fetchDeclarationsLive();
+      fetchNotesLive();
     });
   }
 
@@ -3717,7 +4274,9 @@ document.addEventListener("DOMContentLoaded", function () {
   // Best-effort initial live attempt — falls back to demo silently on any failure.
   fetchLive();
   fetchRecruitmentLive();
+  fetchFormateursLive();
   fetchDeclarationsLive();
+  fetchNotesLive();
   loadManualMatches();
 })();
 </script>
