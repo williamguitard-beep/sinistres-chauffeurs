@@ -2011,14 +2011,24 @@ document.addEventListener("DOMContentLoaded", function () {
   /* =========================================================
      Notes de test de conduite + statut formation
      ---------------------------------------------------------
-     Source : "sinistres_notes_72.csv" (Drive standalone, extrait du
-     classeur "Monitoring : Sinistralité des Chauffeurs"). 72 chauffeurs
-     accidentés recroisés avec le suivi formation. Colonnes utilisées :
-       phone / fsName          — clés de rapprochement
-       score, verdict          — note du test (souvent vide : ~14/72 seulement)
-       statut                  — étape de formation (test_echoue, assigne, ...)
-       moniteurSaisi           — moniteur qui a saisi la fiche (rempli le plus souvent)
-       formateurFiche          — formateur sur fiche (rarement rempli)
+     Source : "sinistres_formateurs.csv" (Drive standalone, extrait du
+     classeur "Monitoring : Sinistralité des Chauffeurs" — depuis le
+     2026-09-11 remplace le précédent extract sinistres_notes_72, qui
+     ne couvrait qu'un sous-ensemble). Une ligne PAR CHAUFFEUR sinistré,
+     déjà agrégée côté source. Colonnes utilisées :
+       sinistre_phone / sinistre_name  — clés de rapprochement
+       found_in_pitlane                — a un dossier PITLANE (true/false)
+       driver_status                   — statut formation PITLANE
+                                          (assigne, nouveau, recontacter,
+                                          test_echoue, attente_vehicule, ...)
+       test_done, test_date            — passage du test de conduite
+       test_score                      — note (souvent vide, ~20-30 % rempli)
+       test_validated                  — bool : test passé et validé
+       moniteur_test_account           — moniteur qui a fait passer le test
+       formateur_fiche                 — formateur nommé sur la fiche
+                                          (le plus rempli côté PITLANE)
+       formation_moniteur_saisi        — moniteur de formation saisi
+       formation_done                  — bool : formation terminée
      ========================================================= */
 
   // MCP renvoie le CSV comme texte brut avec échappements markdown-like
@@ -2052,28 +2062,49 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   // Construit deux index :
-  //   byPhone : clé la plus fiable (matchBy=phone dans 60 % du CSV)
+  //   byPhone : clé la plus fiable
   //   byKey   : nom normalisé (même normalizeDriverName que le master),
-  //             fallback pour les 40 % restants (matchBy=name)
+  //             fallback pour les chauffeurs sans téléphone dans le CSV
   function buildNotesIndex(rows) {
     var byPhone = {}, byKey = {}, count = 0;
     rows.forEach(function (row) {
-      if (!row.fsName && !row.csvName) return;
-      var scoreRaw = row.score;
+      var name = row.sinistre_name;
+      if (!name) return;
+      var scoreRaw = row.test_score;
+      // Le CSV renvoie "true" / "false" / "" ; on mappe vers un libellé
+      // homogène avec l'ancien schéma (valide / elimine / non_teste) pour
+      // que la carte "Score × sinistres" et le tableau formateur restent
+      // lisibles.
+      var validated = String(row.test_validated || "").toLowerCase();
+      var verdict = null;
+      if (validated === "true") verdict = "valide";
+      else if (validated === "false" && String(row.test_done || "").toLowerCase() === "true") verdict = "elimine";
+      // Statut formation : driver_status côté PITLANE quand rapproché
+      // (assigne, nouveau, recontacter, test_echoue, attente_vehicule).
+      // Sinon "non_rattache_pitlane" pour distinguer d'une case vide.
+      var statutFormation = row.driver_status ||
+        (String(row.found_in_pitlane || "").toLowerCase() === "false" ? "non_rattache_pitlane" : null);
+      // Formateur : formateur_fiche est le plus fiable (PITLANE), avec
+      // fallback sur formation_moniteur_saisi puis moniteur_test_account.
+      // Priorité au premier non vide — même logique que pick().
+      var moniteur = row.formateur_fiche || row.formation_moniteur_saisi || row.moniteur_test_account || null;
       var entry = {
-        fsName: row.fsName || row.csvName,
-        statutFormation: row.statut || null,   // test_echoue|assigne|nouveau|recontacter|attente_vehicule
+        fsName: name,
+        statutFormation: statutFormation,
         note: scoreRaw !== "" && scoreRaw != null ? Number(scoreRaw) : null,
-        verdict: row.verdict || null,          // elimine|valide|""
-        formationDate: row.formationDate || null,
-        // "moniteurSaisi" est rempli le plus souvent ; formateurFiche
-        // sinon. Priorité au premier non vide — même logique que pick().
-        moniteur: row.moniteurSaisi || row.formateurFiche || row.moniteurTest || null,
-        nbSinCSV: row.nbSin ? Number(row.nbSin) : null
+        verdict: verdict,
+        formationDate: row.test_date || null,
+        moniteur: moniteur,
+        // sinistres_count côté CSV : compteur DÉJÀ AGRÉGÉ par chauffeur au
+        // moment de l'extract. Uniquement informatif ici — l'artefact
+        // recompte lui-même à partir du master, qui reste la vérité.
+        nbSinCSV: row.sinistres_count ? Number(row.sinistres_count) : null,
+        // Vrai si PITLANE connaît ce chauffeur (a un dossier de formation).
+        foundInPitlane: String(row.found_in_pitlane || "").toLowerCase() === "true"
       };
-      var phone = phoneDigits(row.phone);
+      var phone = phoneDigits(row.sinistre_phone);
       if (phone) byPhone[phone] = entry;
-      var key = normalizeDriverName(row.fsName || row.csvName);
+      var key = normalizeDriverName(name);
       if (key) byKey[key] = entry;
       count++;
     });
@@ -2213,9 +2244,10 @@ document.addEventListener("DOMContentLoaded", function () {
     return "<div class=\"card\">" +
       "<h3>Notes du test de conduite × sinistres</h3>" +
       "<p class=\"note warn-note\"><strong>Exploratoire — n=" + drivers.length + ".</strong> " +
-        "Sur les 72 chauffeurs suivis dans le CSV notes, une quinzaine seulement ont un score renseigné, " +
-        "et tous n'apparaissent pas dans la sélection filtrée. Une tranche montrant plus de sinistres par chauffeur " +
-        "qu'une autre est une <em>piste</em>, pas une preuve — comparez sur \"sinistres par chauffeur\" et non sur le total.</p>" +
+        "Beaucoup de chauffeurs n'ont pas de score renseigné (test non passé ou non enregistré), " +
+        "et tous ceux qui en ont un ne passent pas la sélection filtrée. Une tranche montrant plus de sinistres " +
+        "par chauffeur qu'une autre est une <em>piste</em>, pas une preuve — comparez sur \"sinistres par chauffeur\" " +
+        "et non sur le total brut.</p>" +
       "<table><thead><tr>" +
         "<th>Tranche de score</th><th>Chauffeurs</th><th>Sinistres</th><th>Par chauffeur</th>" +
       "</tr></thead><tbody>" + body + "</tbody></table>" +
@@ -2353,10 +2385,11 @@ document.addEventListener("DOMContentLoaded", function () {
     var couverts = filtered.filter(function (r) { return r.statutFormation != null; }).length;
     var header = "<div class=\"card\">" +
       "<h3>Notes &amp; Formation</h3>" +
-      "<p class=\"note\">Rapprochement du CSV <em>sinistres_notes_72.csv</em> (72 chauffeurs suivis) avec les sinistres " +
-        "du master. Clé de rapprochement&nbsp;: téléphone (le plus fiable), fallback nom normalisé. " +
+      "<p class=\"note\">Rapprochement du CSV <em>sinistres_formateurs.csv</em> (une ligne par chauffeur sinistré, " +
+        "agrégé côté source) avec les sinistres du master. Clé&nbsp;: téléphone (fiable), fallback nom normalisé. " +
         "<strong>" + couverts + "</strong> sinistre" + (couverts > 1 ? "s" : "") + " de la sélection actuelle " +
-        "porte" + (couverts > 1 ? "nt" : "") + " une note ou un statut formation rapproché.</p>" +
+        "porte" + (couverts > 1 ? "nt" : "") + " un statut formation rapproché (PITLANE ou <em>non_rattache_pitlane</em> " +
+        "pour les chauffeurs sans dossier).</p>" +
     "</div>";
     panel.innerHTML = header +
       noteVsSinistresCard(filtered) +
@@ -3112,12 +3145,18 @@ document.addEventListener("DOMContentLoaded", function () {
   // position (gid=0) le 2026-09-03 — meme contrainte export CSV que les
   // deux classeurs ci-dessus (voir fetchLive).
   var DECLARATIONS_SPREADSHEET_ID = '1bUscyVCQF7hKIPNUZ5YWMsfEWzJXakWhQSd-uMcUBtI';
-  // Extract du classeur "Monitoring : Sinistralité des Chauffeurs" — tenu
-  // par William, 72 chauffeurs avec statut formation, score/verdict au test
-  // de conduite, et moniteur d'accompagnement. Fichier CSV Drive standalone
-  // (pas un onglet publié) : lu via read_file_content, jamais publié en
-  // clair car nominatif (noms + téléphones). William, 2026-09-10.
-  var NOTES_FILE_ID = '1zLQ0vjhr9PU3iIMaZWobP2i_MR-q6n5M';
+  // Extract du classeur "Monitoring : Sinistralité des Chauffeurs" — CSV
+  // Drive standalone tenu par William. Une ligne par chauffeur sinistré
+  // (~350 chauffeurs, tous ceux qui apparaissent dans le master), déjà
+  // agrégé par téléphone côté source ; colonnes formation issues de
+  // PITLANE quand le rapprochement a marché : found_in_pitlane / driver_status,
+  // test_score / test_validated, moniteur_test_account, formateur_fiche /
+  // formation_moniteur_saisi, formation_done. William, 2026-09-11 : "prend
+  // Sinistres formateurs" — remplace l'extract précédent (sinistres_notes_72,
+  // qui n'avait que le sous-ensemble de 72 chauffeurs suivis, obsolète depuis
+  // que le classeur produit sinistres_formateurs). Jamais publié en clair
+  // car nominatif (noms + téléphones).
+  var NOTES_FILE_ID = '1-BZbONVv-S7lgXfElECRIuF8dfAzxtOt';
 
   // Locates the heading + fenced code block for one specific tab inside a
   // multi-tab contentSnippet, instead of blindly taking the first ``` block
