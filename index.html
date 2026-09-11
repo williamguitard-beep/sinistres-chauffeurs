@@ -2049,13 +2049,16 @@ document.addEventListener("DOMContentLoaded", function () {
   }
 
   // Parse le CSV notes en tableau d'objets. Utilise parseCsvBlock qui
-  // gère déjà l'absence de fence markdown, puis unescape les valeurs.
+  // gère déjà l'absence de fence markdown, puis unescape à la fois les
+  // CLÉS et les valeurs — MCP renvoie le CSV avec des \_ dans les
+  // en-têtes ("sinistre\_name"), ce qui empêche row.sinistre_name de
+  // matcher tant qu'on n'a pas retiré les backslashes des noms de colonnes.
   function parseNotesCSV(text) {
     var rows = parseCsvBlock(String(text));
     return rows.map(function (row) {
       var out = {};
       Object.keys(row).forEach(function (k) {
-        out[k.trim()] = unescapeMarkdown(row[k]).trim();
+        out[unescapeMarkdown(k).trim()] = unescapeMarkdown(row[k]).trim();
       });
       return out;
     });
